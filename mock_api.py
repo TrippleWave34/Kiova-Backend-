@@ -33,7 +33,7 @@ MOCK_PRODUCTS = [
         "color": "Blue",
         "pattern": "Solid",
         "price": 89.99,
-        "image_url": "https://placehold.co/400x400/000080/FFFFFF/png?text=Denim+Jacket",
+        "image_urls": ["https://placehold.co/400x400/000080/FFFFFF/png?text=Denim+Jacket"],
         "tags": ["Vintage", "Casual", "Blue", "Denim"],
         "style": "Vintage"
     },
@@ -45,7 +45,10 @@ MOCK_PRODUCTS = [
         "color": "White",
         "pattern": "Solid",
         "price": 45.50,
-        "image_url": "https://placehold.co/400x400/F5F5DC/000000/png?text=Linen+Pants",
+        "image_urls": [
+            "https://placehold.co/400x400/F5F5DC/000000/png?text=Linen+Pants+Front",
+            "https://placehold.co/400x400/F5F5DC/000000/png?text=Linen+Pants+Back"
+        ],
         "tags": ["Summer", "Classy", "White", "Linen"],
         "style": "Classy"
     },
@@ -57,7 +60,10 @@ MOCK_PRODUCTS = [
         "color": "Grey",
         "pattern": "Solid",
         "price": 29.99,
-        "image_url": "https://placehold.co/400x400/808080/FFFFFF/png?text=Sneakers",
+        "image_urls": [
+            "https://placehold.co/400x400/808080/FFFFFF/png?text=Sneakers",
+            "https://placehold.co/400x400/808080/FFFFFF/png?text=Sneakers+Side"
+        ],
         "tags": ["Sporty", "Streetwear", "Grey"],
         "style": "Streetwear"
     },
@@ -69,7 +75,7 @@ MOCK_PRODUCTS = [
         "color": "White",
         "pattern": "Solid",
         "price": 45.00,
-        "image_url": "https://placehold.co/400x400/FFFFFF/000000/png?text=White+Shirt",
+        "image_urls": ["https://placehold.co/400x400/FFFFFF/000000/png?text=White+Shirt"],
         "tags": ["Formal", "Work", "White"],
         "style": "Classy"
     },
@@ -81,7 +87,10 @@ MOCK_PRODUCTS = [
         "color": "Black",
         "pattern": "Graphic",
         "price": 35.00,
-        "image_url": "https://placehold.co/400x400/000000/FFFFFF/png?text=Band+Tee",
+        "image_url": [
+            "https://placehold.co/400x400/000000/FFFFFF/png?text=Band+Tee",
+            "https://placehold.co/400x400/000000/FFFFFF/png?text=Band+Tee+Back"
+            ],
         "tags": ["Edgy", "Black", "Cotton"],
         "style": "Edgy"
     }
@@ -110,7 +119,7 @@ class ProductBase(BaseModel):
     name: str
     price: float
     tags: List[str]
-    image_url: str
+    image_urls: List[str]
     category: str       
     sub_category: str   
     color: str          
@@ -213,6 +222,19 @@ def analyze_image(file: UploadFile = File(...)):
             "processed_image_url": "https://placehold.co/400x400/transparent/png?text=Clean+Image"
         }
     }
+
+
+@app.post("/upload")
+def upload_file(file: UploadFile = File(...)):
+    """
+    Simulates uploading a file to storage.
+    Returns a fake URL.
+    """
+    # Simulate network delay
+    time.sleep(1)
+    
+    # Return a fake URL
+    return {"url": f"https://placehold.co/600x800/orange/white/png?text={file.filename}"}
 
 @app.post("/products", status_code=201)
 def add_product(product: ProductBase):
