@@ -54,3 +54,26 @@ Run this to execute the migration.
 ```bash
 alembic upgrade head
 ```
+
+# Deployment to Azure
+There are two ways to deploy this API to the Azure Container App.
+
+### Method 1: GitHub Actions (Automatic)
+Recommended. The CI/CD pipeline runs automatically whenever you push code to the repository.
+1. Commit and push changes to the main branch.
+2. Check the Actions tab in GitHub to monitor the build.
+3. The Azure Container App will automatically pull the latest image tag.
+Note: Requires ACR_USERNAME and ACR_PASSWORD secrets to be configured in GitHub Settings.
+
+### Method 2: Manual Script (Fallback)
+Use this if you need to force a deployment from your local machine or if GitHub Actions is failing.
+Prerequisites:
+- Azure CLI installed (az login successful)
+- Docker installed and running
+
+Run the script:
+```bash
+chmod +x deploy.sh
+./deploy.sh
+```
+This script will build the Docker image locally, push it to the Azure Container Registry, and force the Container App to update.
