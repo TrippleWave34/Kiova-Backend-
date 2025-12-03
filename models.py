@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String, Float, ARRAY
+from pgvector.sqlalchemy import Vector
 from database import Base
 
 class Product(Base):
@@ -14,3 +15,4 @@ class Product(Base):
     pattern = Column(String)      
     style = Column(String)        
     tags = Column(ARRAY(String))
+    embedding = Column(Vector(1536))

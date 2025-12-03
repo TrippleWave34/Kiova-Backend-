@@ -7,3 +7,5 @@ python-multipart
 alembic
 azure-storage-blob
 dotenv
+openai
+pgvector

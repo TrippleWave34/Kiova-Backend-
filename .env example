@@ -4,3 +4,7 @@ DB_HOST=db_host.com
 DB_NAME=postgres
 AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=..."
 AZURE_CONTAINER_NAME="products"
+AZURE_AI_ENDPOINT="https://kiova-resource.cognitiveservices.azure.com/"
+AZURE_AI_KEY="[YOUR_KEY_FROM_PORTAL]"
+AZURE_DEPLOYMENT_CHAT="o4-mini"
+AZURE_DEPLOYMENT_EMBEDDING="text-embedding-3-small"
