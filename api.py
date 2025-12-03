@@ -5,11 +5,27 @@ from typing import List, Optional
 import uuid
 import shutil
 import os
+from azure.storage.blob import BlobServiceClient
+import os
+from dotenv import load_dotenv
 
 # Import our new modules
 import models
 from database import engine, get_db
 from pydantic import BaseModel
+
+load_dotenv()
+
+# --- AZURE CONFIG ---
+AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
+CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME")
+
+# Validate (Crash if missing keys)
+if not AZURE_CONNECTION_STRING or not CONTAINER_NAME:
+    raise ValueError("Azure Storage keys missing in .env")
+
+# Initialize Client
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
 
 # --- DATABASE RESET ---
 # Since we changed the model (String -> Array), we need to recreate tables.
@@ -46,24 +62,34 @@ class ProductResponse(ProductCreate):
 
 # --- 2. THE NEW UPLOAD ENDPOINT ---
 @app.post("/upload")
-def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...)):
     """
-    1. Receives a file (binary).
-    2. Saves it to the /static folder.
-    3. Returns the URL.
+    Uploads file to Azure Blob Storage and returns the public URL.
     """
-    # Generate unique filename to prevent overwrites
-    file_extension = file.filename.split(".")[-1]
-    unique_filename = f"{uuid.uuid4()}.{file_extension}"
-    file_path = f"static/{unique_filename}"
-    
-    # Save the file locally
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    try:
+        # 1. Create a unique filename
+        file_extension = file.filename.split(".")[-1]
+        unique_filename = f"{uuid.uuid4()}.{file_extension}"
         
-    # Return the URL (For local dev, use localhost)
-    # In production, this would be an Azure Blob URL
-    return {"url": f"http://127.0.0.1:8000/{file_path}"}
+        # 2. Get the blob client
+        blob_client = blob_service_client.get_blob_client(
+            container=CONTAINER_NAME, 
+            blob=unique_filename
+        )
+
+        # 3. Upload the data
+        # Note: file.file is a SpooledTemporaryFile, we read it
+        blob_client.upload_blob(file.file.read())
+
+        # 4. Construct the Public URL
+        # Format: https://<account>.blob.core.windows.net/<container>/<filename>
+        blob_url = blob_client.url
+        
+        return {"url": blob_url}
+
+    except Exception as e:
+        # Good for debugging what went wrong
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- 3. CREATE PRODUCT ENDPOINT ---
 @app.post("/products", response_model=ProductResponse)

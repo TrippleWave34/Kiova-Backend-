@@ -2,3 +2,5 @@ DB_USER=db_user
 DB_PASSWORD=db_password
 DB_HOST=db_host.com
 DB_NAME=postgres
+AZURE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=..."
+AZURE_CONTAINER_NAME="products"
