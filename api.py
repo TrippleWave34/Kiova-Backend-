@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Header
 from fastapi.staticfiles import StaticFiles 
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -13,10 +13,13 @@ from dotenv import load_dotenv
 import models
 from database import engine, get_db
 from pydantic import BaseModel
+from rembg import remove
+from PIL import Image
+import io
 
 load_dotenv()
 
-# --- AZURE CONFIG ---
+# --- CONFIGURATION ---
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING")
 CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME")
 
@@ -37,26 +40,15 @@ ai_client = AzureOpenAI(
     api_version="2024-12-01-preview"
 )
 
-# --- DATABASE RESET ---
-# Since we changed the model (String -> Array), we need to recreate tables.
-# In production, use Alembic. For now, we drop and create.
-# models.Base.metadata.drop_all(bind=engine)
+# --- DB INIT ---
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Kiova Real Backend v1")
-
-# --- 1. SETUP STATIC FILE SERVING (Local Storage) ---
-# Create a folder named 'static' if it doesn't exist
-os.makedirs("static", exist_ok=True)
-
-# This makes http://localhost:8000/static/image.jpg accessible
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app = FastAPI(title="Kiova Real Backend v2")
 
 # --- PYDANTIC SCHEMAS ---
 class ProductCreate(BaseModel):
     name: str
     price: float
-    # CHANGED: Now accepts a list of strings
     image_urls: List[str] 
     category: str
     sub_category: str
@@ -65,19 +57,69 @@ class ProductCreate(BaseModel):
     style: str
     tags: List[str]
 
+class ProductUpdate(BaseModel):
+    name: Optional[str] = None
+    price: Optional[float] = None
+    image_urls: Optional[List[str]] = None
+    category: Optional[str] = None
+    sub_category: Optional[str] = None
+    color: Optional[str] = None
+    pattern: Optional[str] = None
+    style: Optional[str] = None
+    tags: Optional[List[str]] = None
+
 class ProductResponse(ProductCreate):
     id: str
     class Config:
-        orm_mode = True 
+        from_attributes = True
+
+class WardrobeItemResponse(BaseModel):
+    id: str
+    image_url: str
+    category: str
+    style: str
+    tags: List[str]
+    class Config:
+        from_attributes = True
 
 class StyleMeRequest(BaseModel):
-    # Only one needed, but keep flexible
     wardrobe_item_id: Optional[str] = None
     product_id: Optional[str] = None
 
-# --- HELPER: GENERATE EMBEDDING ---
+# ==========================================
+# HELPER FUNCTIONS (The Brains)
+# ==========================================
+
+def process_and_upload(file_bytes, filename):
+    """
+    1. Removes Background using Rembg (CPU).
+    2. Converts to PNG.
+    3. Uploads the CLEAN image to Azure Blob.
+    """
+    try:
+        # A. Load Image & Remove Background
+        input_image = Image.open(io.BytesIO(file_bytes))
+        output_image = remove(input_image) # AI Background Removal happens here
+        
+        # B. Save to Buffer as PNG (Transparency requires PNG)
+        output_buffer = io.BytesIO()
+        output_image.save(output_buffer, format="PNG")
+        output_buffer.seek(0)
+        
+        # C. Generate Azure Filename (Force .png extension)
+        unique_name = f"{uuid.uuid4()}.png"
+        
+        # D. Upload
+        blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=unique_name)
+        blob_client.upload_blob(output_buffer)
+        
+        return blob_client.url
+    except Exception as e:
+        print(f"Background Removal Error: {e}")
+        raise HTTPException(status_code=500, detail="Image processing failed")
+
 def get_vector(text_input: str):
-    """Turns text into a list of 1536 numbers using Azure OpenAI."""
+    """Turns text into Vector (1536 dim)."""
     try:
         response = ai_client.embeddings.create(
             input=text_input,
@@ -88,53 +130,18 @@ def get_vector(text_input: str):
         print(f"Embedding Error: {e}")
         return []
 
-# --- 1. THE NEW UPLOAD ENDPOINT ---
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+def get_ai_metadata(image_url: str):
     """
-    Uploads file to Azure Blob Storage and returns the public URL.
+    Calls GPT-4o-Mini Vision to analyze the image.
+    Returns Dictionary: {category, color, style, tags...}
     """
-    try:
-        # 1. Create a unique filename
-        file_extension = file.filename.split(".")[-1]
-        unique_filename = f"{uuid.uuid4()}.{file_extension}"
-        
-        # 2. Get the blob client
-        blob_client = blob_service_client.get_blob_client(
-            container=CONTAINER_NAME, 
-            blob=unique_filename
-        )
-
-        # 3. Upload the data
-        # Note: file.file is a SpooledTemporaryFile, we read it
-        blob_client.upload_blob(file.file.read())
-
-        # 4. Construct the Public URL
-        # Format: https://<account>.blob.core.windows.net/<container>/<filename>
-        blob_url = blob_client.url
-        
-        return {"url": blob_url}
-
-    except Exception as e:
-        # Good for debugging what went wrong
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# --- 2. AI AUTO-TAGGING (Vision) ---
-@app.post("/analyze-image")
-async def analyze_image(file: UploadFile = File(...)):
-    # 1. Upload temp image to get URL for Vision model
-    upload_res = await upload_file(file)
-    image_url = upload_res["url"]
-
-    # 2. Call GPT-4o-Mini Vision
     try:
         response = ai_client.chat.completions.create(
             model=DEPLOYMENT_CHAT,
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are a fashion expert. Analyze the clothing image. Return a VALID JSON object with keys: category, sub_category, color, pattern, style, and tags (list of 5 string keywords)."
+                    "content": "You are a fashion expert. Analyze the clothing image. Return a VALID JSON object with keys: category (Top/Bottom/Shoes/Outerwear), sub_category, color, pattern, style, and tags (list of 5 string keywords)."
                 },
                 {
                     "role": "user", 
@@ -146,29 +153,43 @@ async def analyze_image(file: UploadFile = File(...)):
             ],
             response_format={"type": "json_object"}
         )
-        
-        ai_data = json.loads(response.choices[0].message.content)
-        ai_data["processed_image_url"] = image_url # Return the URL to frontend
-        ai_data["suggested_price"] = 0.0 # Placeholder
-        
-        return {"status": "success", "ai_results": ai_data}
-
+        return json.loads(response.choices[0].message.content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Vision Error: {e}")
+        raise HTTPException(status_code=500, detail="AI Analysis Failed")
 
-# --- 3. CREATE PRODUCT ENDPOINT ---
+# ==========================================
+# ENDPOINTS
+# ==========================================
+
+# --- 1. ADMIN: Analyze Image (For Store Inventory) ---
+# Used when Admin wants to verify tags BEFORE saving
+@app.post("/analyze-image")
+async def analyze_image(file: UploadFile = File(...)):
+    # 1. Upload
+    image_url = process_and_upload(file.file.read(), file.filename)
+    
+    # 2. Analyze
+    ai_data = get_ai_metadata(image_url)
+    
+    # 3. Return to Frontend for review
+    ai_data["processed_image_url"] = image_url
+    return {"status": "success", "ai_results": ai_data}
+
+
+# --- 2. ADMIN: Create Product (Final Save) ---
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, db: Session = Depends(get_db)):
     new_id = str(uuid.uuid4())
 
-    description_for_ai = f"{product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
-    vector = get_vector(description_for_ai)
+    # Generate Vector from the verified tags
+    description = f"{product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
+    vector = get_vector(description)
     
     db_item = models.Product(
         id=new_id,
         name=product.name,
         price=product.price,
-        # Save the list of URLs directly
         image_urls=product.image_urls,
         category=product.category,
         sub_category=product.sub_category,
@@ -184,57 +205,73 @@ def create_product(product: ProductCreate, db: Session = Depends(get_db)):
     db.refresh(db_item)
     return db_item
 
-@app.get("/products", response_model=List[ProductResponse])
-def get_products(category: Optional[str] = None, search: Optional[str] = None, db: Session = Depends(get_db)):
-    query = db.query(models.Product)
-    
-    if category:
-        query = query.filter(models.Product.category == category)
-        
-    # Basic Text Search (Can be upgraded to Vector Search later)
-    if search:
-        search_term = f"%{search}%"
-        query = query.filter(models.Product.name.ilike(search_term))
-        
-    return query.all()
 
-
-@app.delete("/products/{product_id}")
-def delete_product(product_id: str, db: Session = Depends(get_db)):
-    product = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+# --- 3. SHOPPER: "My Wardrobe" Upload (The All-In-One) ---
+# This is the "Magic" button. Upload -> Tag -> Vector -> Save.
+@app.post("/wardrobe", response_model=WardrobeItemResponse)
+async def add_to_wardrobe(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    # 1. Upload
+    image_url = process_and_upload(file.file.read(), file.filename)
     
-    db.delete(product)
+    # 2. AI Auto-Tagging
+    meta = get_ai_metadata(image_url)
+    
+    # 3. Vectorize
+    description = f"{meta.get('style')} {meta.get('color')} {meta.get('sub_category')} {' '.join(meta.get('tags', []))}"
+    vector = get_vector(description)
+    
+    # 4. Save to Database immediately
+    new_item = models.WardrobeItem(
+        id=str(uuid.uuid4()),
+        user_id="user_12345", # In real auth, get this from token
+        image_url=image_url,
+        category=meta.get("category", "Unknown"),
+        sub_category=meta.get("sub_category", ""),
+        color=meta.get("color", ""),
+        pattern=meta.get("pattern", ""),
+        style=meta.get("style", "Casual"),
+        tags=meta.get("tags", []),
+        embedding=vector
+    )
+    
+    db.add(new_item)
     db.commit()
-    return {"status": "deleted", "id": product_id}
+    db.refresh(new_item)
+    return new_item
+
+@app.get("/wardrobe", response_model=List[WardrobeItemResponse])
+def get_wardrobe(db: Session = Depends(get_db)):
+    # Add user_id filter here later
+    return db.query(models.WardrobeItem).all()
 
 
-# --- 5. STYLE ME (The Recommendation Engine) ---
+# --- 4. STYLE ME (Hybrid Search) ---
 @app.post("/style-me")
 def style_me(data: StyleMeRequest, db: Session = Depends(get_db)):
-    # 1. Fetch Source Item
-    if data.product_id:
+    source_item = None
+    
+    # Fetch from Wardrobe OR Products
+    if data.wardrobe_item_id:
+        source_item = db.query(models.WardrobeItem).filter(models.WardrobeItem.id == data.wardrobe_item_id).first()
+    elif data.product_id:
         source_item = db.query(models.Product).filter(models.Product.id == data.product_id).first()
-    # Add logic for Wardrobe item fetching here when you build the Wardrobe Table
-    else:
-        raise HTTPException(404, "No item specified")
         
     if not source_item:
         raise HTTPException(404, "Item not found")
 
-    # 2. Define Complementary Categories
+    # Define Logic (e.g. Top needs Bottoms/Shoes)
     target_categories = []
     if source_item.category == "Top": target_categories = ["Bottom", "Shoes", "Outerwear"]
     elif source_item.category in ["Bottom", "Pants"]: target_categories = ["Top", "Shoes", "Outerwear"]
     elif source_item.category == "Shoes": target_categories = ["Top", "Bottom", "Outerwear"]
     
-    # 3. Query Database
-    # Logic: Get items in target categories + Matching Style
+    # Vector Search
+    # Find items in target categories that are visually/stylistically similar
     matches = db.query(models.Product).filter(
         models.Product.category.in_(target_categories),
-        models.Product.style == source_item.style,
-        models.Product.id != source_item.id
+        models.Product.id != getattr(source_item, 'id', '') # Don't match self if looking at store item
+    ).order_by(
+        models.Product.embedding.cosine_distance(source_item.embedding)
     ).limit(5).all()
 
     return {
@@ -242,3 +279,68 @@ def style_me(data: StyleMeRequest, db: Session = Depends(get_db)):
         "styled_matches": matches,
         "style_tip": f"Matching {source_item.style} vibes."
     }
+
+# --- 5. PRODUCTS (Read Only) ---
+@app.get("/products", response_model=List[ProductResponse])
+def get_products(category: Optional[str] = None, search: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(models.Product)
+    
+    if category:
+        query = query.filter(models.Product.category == category)
+        
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(models.Product.name.ilike(search_term))
+        
+    return query.all()
+
+# --- 6. ADMIN: UPDATE PRODUCT ---
+@app.put("/products/{product_id}")
+def update_product(product_id: str, updates: ProductUpdate, db: Session = Depends(get_db)):
+    """
+    Updates specific fields of a product. 
+    If tags/style/color change, it recalculates the AI Vector automatically.
+    """
+    # 1. Find Product
+    item = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # 2. Update fields dynamically
+    update_data = updates.model_dump(exclude_unset=True) # Only update fields sent by frontend
+    for key, value in update_data.items():
+        setattr(item, key, value)
+
+    # 3. Smart Re-Vectorization
+    # If we changed data that affects search, we must update the embedding
+    search_fields = ['style', 'color', 'sub_category', 'name', 'tags']
+    if any(k in update_data for k in search_fields):
+        # Re-generate description based on new values
+        description = f"{item.style} {item.color} {item.sub_category} {item.name} {' '.join(item.tags)}"
+        item.embedding = get_vector(description)
+
+    db.commit()
+    db.refresh(item)
+    return item
+
+# --- 7. ADMIN: DELETE PRODUCT ---
+@app.delete("/products/{product_id}")
+def delete_product(product_id: str, db: Session = Depends(get_db)):
+    item = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    db.delete(item)
+    db.commit()
+    return {"status": "deleted", "id": product_id}
+
+# --- 8. WARDROBE: DELETE ITEM ---
+@app.delete("/wardrobe/{item_id}")
+def delete_wardrobe_item(item_id: str, db: Session = Depends(get_db)):
+    item = db.query(models.WardrobeItem).filter(models.WardrobeItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Wardrobe item not found")
+    
+    db.delete(item)
+    db.commit()
+    return {"status": "deleted", "id": item_id}

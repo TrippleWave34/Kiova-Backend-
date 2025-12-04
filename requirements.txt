@@ -9,3 +9,6 @@ azure-storage-blob
 dotenv
 openai
 pgvector
+rembg
+pillow
+onnxruntime
