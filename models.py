@@ -8,11 +8,11 @@ class Product(Base):
     name = Column(String)
     price = Column(Float)
     image_urls = Column(JSON) 
-    category = Column(String)     
-    sub_category = Column(String) 
-    color = Column(String)        
-    pattern = Column(String)      
-    style = Column(String)        
+    category = Column(String, nullable=True)     
+    sub_category = Column(String, nullable=True) 
+    color = Column(String, nullable=True)        
+    pattern = Column(String, nullable=True)      
+    style = Column(String, nullable=True)        
     tags = Column(JSON)
     embedding = Column(Vector(1536))
 
@@ -24,11 +24,11 @@ class WardrobeItem(Base):
     image_url = Column(String)
     
     # AI Data
-    category = Column(String)
-    sub_category = Column(String)
-    color = Column(String)
-    pattern = Column(String)
-    style = Column(String)
+    category = Column(String, nullable=True)
+    sub_category = Column(String, nullable=True)
+    color = Column(String, nullable=True)
+    pattern = Column(String, nullable=True)
+    style = Column(String, nullable=True)
     tags = Column(JSON)
     
     # Vector for matching
