@@ -86,6 +86,22 @@ class StyleMeRequest(BaseModel):
     wardrobe_item_id: Optional[str] = None
     product_id: Optional[str] = None
 
+class StyleSourceResponse(BaseModel):
+    id: str
+    category: Optional[str] = None
+    style: Optional[str] = None
+    # Include both potential image fields (one will be null)
+    image_url: Optional[str] = None       # For Wardrobe Items
+    image_urls: Optional[List[str]] = None # For Store Products
+    
+    class Config:
+        from_attributes = True
+
+class StyleMeResponse(BaseModel):
+    user_item: StyleSourceResponse
+    styled_matches: List[ProductResponse]
+    style_tip: str
+
 # ==========================================
 # HELPER FUNCTIONS (The Brains)
 # ==========================================
@@ -246,7 +262,7 @@ def get_wardrobe(db: Session = Depends(get_db)):
 
 
 # --- 4. STYLE ME (Hybrid Search) ---
-@app.post("/style-me")
+@app.post("/style-me", response_model=StyleMeResponse) 
 def style_me(data: StyleMeRequest, db: Session = Depends(get_db)):
     source_item = None
     
