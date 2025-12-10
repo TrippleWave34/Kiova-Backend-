@@ -38,8 +38,8 @@ ai_client = AzureOpenAI(
 
 # --- DB INIT ---
 # (Note: Use Alembic for migrations, this is just for initial setup)
-models.Base.metadata.drop_all(bind=engine) 
-models.Base.metadata.create_all(bind=engine)
+# models.Base.metadata.drop_all(bind=engine) 
+# models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Kiova Real Backend v2")
 
