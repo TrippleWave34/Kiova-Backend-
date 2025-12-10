@@ -154,7 +154,14 @@ def get_ai_metadata(image_url: str):
             ],
             response_format={"type": "json_object"}
         )
-        return json.loads(response.choices[0].message.content)
+        
+        data = json.loads(response.choices[0].message.content)
+
+        # Check if color is returned as a list/array
+        if "color" in data and isinstance(data["color"], list):
+            data["color"] = " and ".join(data["color"])
+            
+        return data
     except Exception as e:
         print(f"Vision Error: {e}")
         raise HTTPException(status_code=500, detail="AI Analysis Failed")
