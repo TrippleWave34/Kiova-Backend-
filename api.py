@@ -292,7 +292,7 @@ def get_products(category: Optional[str] = None, gender: Optional[str] = None, s
         
     return query.all()
 
-@app.put("/products/{product_id}")
+@app.put("/products/{product_id}", response_model=ProductResponse)
 def update_product(product_id: str, updates: ProductUpdate, db: Session = Depends(get_db)):
     item = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not item: raise HTTPException(404, detail="Product not found")
