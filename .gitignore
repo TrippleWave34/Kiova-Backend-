@@ -1,5 +1,6 @@
 # Secrets
 .env
+serviceAccountKey.json
 
 # Python Cache
 __pycache__/

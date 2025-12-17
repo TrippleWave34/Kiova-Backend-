@@ -1,4 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Header
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Header, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles 
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -14,6 +16,9 @@ from pydantic import BaseModel
 from rembg import remove
 from PIL import Image
 import io
+import base64
+import firebase_admin
+from firebase_admin import auth, credentials
 
 load_dotenv()
 
@@ -24,11 +29,20 @@ AI_ENDPOINT = os.getenv("AZURE_AI_ENDPOINT")
 AI_KEY = os.getenv("AZURE_AI_KEY")
 DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT", "o4-mini")
 DEPLOYMENT_EMBEDDING = os.getenv("AZURE_DEPLOYMENT_EMBEDDING", "text-embedding-3-small")
+FIREBASE_CREDS_B64 = os.getenv("FIREBASE_CREDENTIALS_BASE64")
+
+if not firebase_admin._apps:
+    try:
+        print("Loading Firebase credentials from Environment Variable...")
+        cred_json = json.loads(base64.b64decode(FIREBASE_CREDS_B64))
+        cred = credentials.Certificate(cred_json)
+        firebase_admin.initialize_app(cred)
+    except Exception as e:
+        print(f"Failed to initialize Firebase: {e}")
 
 if not AZURE_CONNECTION_STRING or not CONTAINER_NAME:
     raise ValueError("Azure Storage keys missing in .env")
 
-# Initialize Clients
 blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
 ai_client = AzureOpenAI(
     azure_endpoint=AI_ENDPOINT,
@@ -36,14 +50,29 @@ ai_client = AzureOpenAI(
     api_version="2024-12-01-preview"
 )
 
-# --- DB INIT ---
-# (Note: Use Alembic for migrations, this is just for initial setup)
 # models.Base.metadata.drop_all(bind=engine) 
-# models.Base.metadata.create_all(bind=engine)
+models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Kiova Real Backend v2")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, lock this down to your real domain
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods
+    allow_headers=["*"], # Allows all headers
+)
+security = HTTPBearer()
 
 # --- PYDANTIC SCHEMAS ---
+
+# --- NEW: User Schemas ---
+class UserSchema(BaseModel):
+    id: str
+    email: str
+    full_name: Optional[str] = None
+    class Config:
+        from_attributes = True
+
 class ProductCreate(BaseModel):
     name: str
     price: float
@@ -80,6 +109,7 @@ class WardrobeItemResponse(BaseModel):
     gender: str
     style: str
     tags: List[str]
+    # user_id: str 
     class Config:
         from_attributes = True
 
@@ -103,7 +133,40 @@ class StyleMeResponse(BaseModel):
     style_tip: str
 
 # ==========================================
-# HELPER FUNCTIONS
+# AUTHENTICATION DEPENDENCY
+# ==========================================
+
+# --- NEW: Logic to verify token and get current user ---
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
+    token = credentials.credentials
+    try:
+        # 1. Verify Token with Firebase
+        decoded_token = auth.verify_id_token(token)
+        uid = decoded_token['uid']
+        email = decoded_token.get('email')
+        
+        # 2. Check if user exists in Postgres
+        user = db.query(models.User).filter(models.User.id == uid).first()
+        
+        if not user:
+            # Auto-create user if they passed Firebase check but aren't in Postgres yet
+            # (Alternatively, you can throw an error and force them to hit /auth/sync)
+            user = models.User(id=uid, email=email)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            
+        return user
+    except Exception as e:
+        print(f"Auth Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+# ==========================================
+# HELPER FUNCTIONS (No changes)
 # ==========================================
 
 def process_and_upload(file_bytes, filename):
@@ -133,9 +196,6 @@ def get_vector(text_input: str):
         return []
 
 def get_ai_metadata(image_url: str):
-    """
-    Calls GPT-4o-Mini Vision to analyze the image.
-    """
     try:
         response = ai_client.chat.completions.create(
             model=DEPLOYMENT_CHAT,
@@ -154,13 +214,9 @@ def get_ai_metadata(image_url: str):
             ],
             response_format={"type": "json_object"}
         )
-        
         data = json.loads(response.choices[0].message.content)
-
-        # Check if color is returned as a list/array
         if "color" in data and isinstance(data["color"], list):
             data["color"] = " and ".join(data["color"])
-            
         return data
     except Exception as e:
         print(f"Vision Error: {e}")
@@ -169,6 +225,25 @@ def get_ai_metadata(image_url: str):
 # ==========================================
 # ENDPOINTS
 # ==========================================
+
+@app.post("/users/sync", response_model=UserSchema)
+def sync_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
+    """
+    Flutter calls this immediately after Firebase Login.
+    It ensures the user exists in Postgres.
+    """
+    token = credentials.credentials
+    decoded_token = auth.verify_id_token(token)
+    uid = decoded_token['uid']
+    email = decoded_token.get('email')
+    
+    user = db.query(models.User).filter(models.User.id == uid).first()
+    if not user:
+        user = models.User(id=uid, email=email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
 
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
@@ -180,8 +255,6 @@ async def analyze_image(file: UploadFile = File(...)):
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, db: Session = Depends(get_db)):
     new_id = str(uuid.uuid4())
-
-    # Generate Vector from the verified tags
     description = f"{product.gender} {product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
     vector = get_vector(description)
     
@@ -206,7 +279,11 @@ def create_product(product: ProductCreate, db: Session = Depends(get_db)):
     return db_item
 
 @app.post("/wardrobe", response_model=WardrobeItemResponse)
-async def add_to_wardrobe(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def add_to_wardrobe(
+    file: UploadFile = File(...), 
+    db: Session = Depends(get_db),
+    # current_user: models.User = Depends(get_current_user) # <--- LOCKED
+):
     image_url = process_and_upload(file.file.read(), file.filename)
     meta = get_ai_metadata(image_url)
     
@@ -215,7 +292,7 @@ async def add_to_wardrobe(file: UploadFile = File(...), db: Session = Depends(ge
     
     new_item = models.WardrobeItem(
         id=str(uuid.uuid4()),
-        user_id="user_12345",
+        user_id="user_12345", #current_user.id,
         image_url=image_url,
         category=meta.get("category", "Unknown"),
         sub_category=meta.get("sub_category", ""),
@@ -233,44 +310,49 @@ async def add_to_wardrobe(file: UploadFile = File(...), db: Session = Depends(ge
     return new_item
 
 @app.get("/wardrobe", response_model=List[WardrobeItemResponse])
-def get_wardrobe(db: Session = Depends(get_db)):
+def get_wardrobe(
+    db: Session = Depends(get_db),
+    # current_user: models.User = Depends(get_current_user)
+):
     return db.query(models.WardrobeItem).all()
+    # return db.query(models.WardrobeItem).filter(models.WardrobeItem.user_id == current_user.id).all()
 
-# --- 4. STYLE ME (Hybrid Search) ---
+# --- UPDATED: Style Me needs user context to find their wardrobe item ---
 @app.post("/style-me", response_model=StyleMeResponse)
-def style_me(data: StyleMeRequest, db: Session = Depends(get_db)):
+def style_me(
+    data: StyleMeRequest, 
+    db: Session = Depends(get_db),
+    # current_user: models.User = Depends(get_current_user)
+):
     source_item = None
     if data.wardrobe_item_id:
-        source_item = db.query(models.WardrobeItem).filter(models.WardrobeItem.id == data.wardrobe_item_id).first()
+        # Ensure the user owns this item
+        source_item = db.query(models.WardrobeItem).filter(
+            models.WardrobeItem.id == data.wardrobe_item_id,
+            # models.WardrobeItem.user_id == current_user.id
+        ).first()
     elif data.product_id:
         source_item = db.query(models.Product).filter(models.Product.id == data.product_id).first()
         
     if not source_item:
-        raise HTTPException(404, "Item not found")
+        raise HTTPException(404, "Item not found or does not belong to you")
 
-    # 1. Category Logic
     target_categories = []
     if source_item.category == "Top": target_categories = ["Bottom", "Shoes", "Outerwear"]
     elif source_item.category in ["Bottom", "Pants"]: target_categories = ["Top", "Shoes", "Outerwear"]
     elif source_item.category == "Shoes": target_categories = ["Top", "Bottom", "Outerwear"]
     
-    # 2. Gender Logic 
-    # If source is Men -> Match Men OR Unisex
-    # If source is Women -> Match Women OR Unisex
-    # If source is Unisex -> Match All
     target_genders = ["Unisex"]
     if source_item.gender == "Men":
         target_genders.append("Men")
     elif source_item.gender == "Women":
         target_genders.append("Women")
     else:
-        # Source is Unisex, match everything
         target_genders.extend(["Men", "Women"])
 
-    # 3. Query
     matches = db.query(models.Product).filter(
         models.Product.category.in_(target_categories),
-        models.Product.gender.in_(target_genders), # Apply Gender Filter
+        models.Product.gender.in_(target_genders),
         models.Product.id != getattr(source_item, 'id', '')
     ).order_by(
         models.Product.embedding.cosine_distance(source_item.embedding)
@@ -285,18 +367,11 @@ def style_me(data: StyleMeRequest, db: Session = Depends(get_db)):
 @app.get("/products", response_model=List[ProductResponse])
 def get_products(category: Optional[str] = None, gender: Optional[str] = None, search: Optional[str] = None, db: Session = Depends(get_db)):
     query = db.query(models.Product)
-    
-    if category:
-        query = query.filter(models.Product.category == category)
-    
-    # Filter by Gender in feed
-    if gender:
-        query = query.filter(models.Product.gender.in_([gender, "Unisex"]))
-
+    if category: query = query.filter(models.Product.category == category)
+    if gender: query = query.filter(models.Product.gender.in_([gender, "Unisex"]))
     if search:
         search_term = f"%{search}%"
         query = query.filter(models.Product.name.ilike(search_term))
-        
     return query.all()
 
 @app.put("/products/{product_id}", response_model=ProductResponse)
@@ -308,7 +383,6 @@ def update_product(product_id: str, updates: ProductUpdate, db: Session = Depend
     for key, value in update_data.items():
         setattr(item, key, value)
 
-    # Re-vectorize if descriptors change
     search_fields = ['style', 'color', 'sub_category', 'name', 'tags', 'gender']
     if any(k in update_data for k in search_fields):
         description = f"{item.gender} {item.style} {item.color} {item.sub_category} {item.name} {' '.join(item.tags)}"
@@ -327,8 +401,12 @@ def delete_product(product_id: str, db: Session = Depends(get_db)):
     return {"status": "deleted", "id": product_id}
 
 @app.delete("/wardrobe/{item_id}")
-def delete_wardrobe_item(item_id: str, db: Session = Depends(get_db)):
-    item = db.query(models.WardrobeItem).filter(models.WardrobeItem.id == item_id).first()
+def delete_wardrobe_item(item_id: str, db: Session = Depends(get_db)):#, current_user: models.User = Depends(get_current_user)):
+    item = db.query(models.WardrobeItem).filter(
+        models.WardrobeItem.id == item_id,
+        # models.WardrobeItem.user_id == current_user.id
+    ).first()
+    
     if not item: raise HTTPException(404, detail="Wardrobe item not found")
     db.delete(item)
     db.commit()

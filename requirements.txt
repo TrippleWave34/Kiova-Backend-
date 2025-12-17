@@ -12,3 +12,4 @@ pgvector
 rembg
 pillow
 onnxruntime
+firebase-admin
