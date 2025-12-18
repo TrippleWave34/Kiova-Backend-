@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import uuid
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 import os
 import json
 from openai import AzureOpenAI
@@ -235,7 +235,10 @@ def process_and_upload(file_bytes, filename):
         output_buffer.seek(0)
         unique_name = f"{uuid.uuid4()}.png"
         blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=unique_name)
-        blob_client.upload_blob(output_buffer)
+        blob_client.upload_blob(
+            output_buffer, 
+            content_settings=ContentSettings(content_type='image/png') 
+        )
         return blob_client.url
     except Exception as e:
         print(f"Background Removal Error: {e}")
