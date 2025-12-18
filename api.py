@@ -19,6 +19,7 @@ import io
 import base64
 import firebase_admin
 from firebase_admin import auth, credentials
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
@@ -53,7 +54,43 @@ ai_client = AzureOpenAI(
 # models.Base.metadata.drop_all(bind=engine) 
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Kiova Real Backend v2")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- STARTUP LOGIC ---
+    print("Executing startup database check...")
+    
+    # We need to manually get a DB session here because Dependency Injection 
+    # doesn't work inside lifespan events the same way as endpoints
+    db = next(get_db()) 
+    
+    try:
+        # Create tables (if not using Alembic)
+        models.Base.metadata.create_all(bind=engine)
+
+        # Check and Seed Categories
+        existing_categories = db.query(models.Category).all()
+        existing_names = {cat.name for cat in existing_categories}
+        
+        for category_name in INITIAL_CATEGORIES:
+            if category_name not in existing_names:
+                new_cat = models.Category(name=category_name)
+                db.add(new_cat)
+        
+        db.commit()
+        print("Initial categories seeded successfully.")
+    except Exception as e:
+        print(f"Error during startup: {e}")
+    finally:
+        db.close()
+
+    # Yield control back to FastAPI to run the application
+    yield 
+
+    # --- SHUTDOWN LOGIC (Optional) ---
+    print("Shutting down application...")
+
+
+app = FastAPI(title="Kiova Real Backend v2", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], # In production, lock this down to your real domain
@@ -61,11 +98,17 @@ app.add_middleware(
     allow_methods=["*"], # Allows all methods
     allow_headers=["*"], # Allows all headers
 )
+
+INITIAL_CATEGORIES = [
+    "Casual", "Streetwear", "Smart Casual", "Business/Formal", "Athletic",
+    "Minimalist", "Trendy", "Vintage", "Y2K", "Techwear", "Peppy",
+    "Elegant", "Boho", "Luxury", "Poppy"
+]
+
 security = HTTPBearer()
 
 # --- PYDANTIC SCHEMAS ---
 
-# --- NEW: User Schemas ---
 class UserSchema(BaseModel):
     id: str
     email: str
@@ -131,6 +174,20 @@ class StyleMeResponse(BaseModel):
     user_item: StyleSourceResponse
     styled_matches: List[ProductResponse]
     style_tip: str
+
+class CategoryBase(BaseModel):
+    name: str
+
+class CategoryCreate(CategoryBase):
+    pass
+
+class CategoryResponse(CategoryBase):
+    id: int
+    class Config:
+        from_attributes = True
+
+class UserCategorySelection(BaseModel):
+    category_ids: List[int]
 
 # ==========================================
 # AUTHENTICATION DEPENDENCY
@@ -411,3 +468,89 @@ def delete_wardrobe_item(item_id: str, db: Session = Depends(get_db)):#, current
     db.delete(item)
     db.commit()
     return {"status": "deleted", "id": item_id}
+
+
+# ==========================================
+# CATEGORY ENDPOINTS
+# ==========================================
+
+@app.get("/categories", response_model=List[CategoryResponse])
+def get_all_categories(db: Session = Depends(get_db)):
+    """
+    Public endpoint to fetch all style categories for the selection screen.
+    """
+    return db.query(models.Category).order_by(models.Category.name).all()
+
+@app.post("/users/me/categories", status_code=status.HTTP_204_NO_CONTENT)
+def select_user_categories(
+    selection: UserCategorySelection,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Saves the list of categories a user has selected. Replaces any old selection.
+    """
+    # Clear previous selections
+    current_user.selected_categories.clear()
+
+    # Find the category objects from the provided IDs
+    categories_to_add = db.query(models.Category).filter(models.Category.id.in_(selection.category_ids)).all()
+    
+    if len(categories_to_add) != len(selection.category_ids):
+        raise HTTPException(status_code=404, detail="One or more category IDs not found")
+        
+    current_user.selected_categories.extend(categories_to_add)
+    db.commit()
+    return
+
+@app.get("/users/me/categories", response_model=List[CategoryResponse])
+def get_user_selected_categories(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Returns the categories the current logged-in user has selected.
+    """
+    return current_user.selected_categories
+
+@app.post("/admin/categories", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED)
+def create_category(
+    category: CategoryCreate, 
+    db: Session = Depends(get_db)
+    # TODO: Add an admin verification dependency here
+):
+    db_category = models.Category(name=category.name)
+    db.add(db_category)
+    db.commit()
+    db.refresh(db_category)
+    return db_category
+
+@app.put("/admin/categories/{category_id}", response_model=CategoryResponse)
+def update_category(
+    category_id: int, 
+    category_update: CategoryCreate, 
+    db: Session = Depends(get_db)
+    # TODO: Add admin check
+):
+    db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
+    if not db_category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    db_category.name = category_update.name
+    db.commit()
+    db.refresh(db_category)
+    return db_category
+
+@app.delete("/admin/categories/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_category(
+    category_id: int, 
+    db: Session = Depends(get_db)
+    # TODO: Add admin check
+):
+    db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
+    if not db_category:
+        raise HTTPException(status_code=404, detail="Category not found")
+        
+    db.delete(db_category)
+    db.commit()
+    return
