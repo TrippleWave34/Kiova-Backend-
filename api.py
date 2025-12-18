@@ -339,7 +339,7 @@ def create_product(product: ProductCreate, db: Session = Depends(get_db)):
 async def add_to_wardrobe(
     file: UploadFile = File(...), 
     db: Session = Depends(get_db),
-    # current_user: models.User = Depends(get_current_user) # <--- LOCKED
+    current_user: models.User = Depends(get_current_user) # <--- LOCKED
 ):
     image_url = process_and_upload(file.file.read(), file.filename)
     meta = get_ai_metadata(image_url)
@@ -349,7 +349,7 @@ async def add_to_wardrobe(
     
     new_item = models.WardrobeItem(
         id=str(uuid.uuid4()),
-        user_id="user_12345", #current_user.id,
+        user_id=current_user.id,
         image_url=image_url,
         category=meta.get("category", "Unknown"),
         sub_category=meta.get("sub_category", ""),
