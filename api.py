@@ -113,6 +113,7 @@ class UserSchema(BaseModel):
     id: str
     email: str
     full_name: Optional[str] = None
+    has_completed_onboarding: bool
     class Config:
         from_attributes = True
 
@@ -304,6 +305,19 @@ def sync_user(credentials: HTTPAuthorizationCredentials = Depends(security), db:
         db.commit()
         db.refresh(user)
     return user
+
+@app.post("/users/me/onboarding", response_model=UserSchema)
+def complete_onboarding(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    Sets the onboarding flag to True. Called when user finishes the intro flow.
+    """
+    current_user.has_completed_onboarding = True
+    db.commit()
+    db.refresh(current_user)
+    return current_user
 
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):

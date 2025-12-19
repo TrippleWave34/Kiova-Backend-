@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, JSON, ForeignKey, DateTime, Table, PrimaryKeyConstraint
+from sqlalchemy import Column, Integer, String, Float, JSON, ForeignKey, DateTime, Table, Boolean
 from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
 from database import Base
@@ -16,6 +16,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     full_name = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    has_completed_onboarding = Column(Boolean, default=False) 
 
     # --- UPDATE: Add relationship to categories ---
     selected_categories = relationship(
