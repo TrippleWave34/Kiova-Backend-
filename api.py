@@ -113,7 +113,7 @@ class UserSchema(BaseModel):
     id: str
     email: str
     full_name: Optional[str] = None
-    has_completed_onboarding: bool
+    has_completed_onboarding: Optional[bool] = False     
     class Config:
         from_attributes = True
 
