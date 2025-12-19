@@ -17,3 +17,6 @@ venv/
 # OS files
 .DS_Store
 static
+
+# Misc
+clean_full.py

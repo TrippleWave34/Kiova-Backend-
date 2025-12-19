@@ -372,24 +372,22 @@ async def add_to_wardrobe(
 @app.get("/wardrobe", response_model=List[WardrobeItemResponse])
 def get_wardrobe(
     db: Session = Depends(get_db),
-    # current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user)
 ):
-    return db.query(models.WardrobeItem).all()
-    # return db.query(models.WardrobeItem).filter(models.WardrobeItem.user_id == current_user.id).all()
+    return db.query(models.WardrobeItem).filter(models.WardrobeItem.user_id == current_user.id).all()
 
-# --- UPDATED: Style Me needs user context to find their wardrobe item ---
 @app.post("/style-me", response_model=StyleMeResponse)
 def style_me(
     data: StyleMeRequest, 
     db: Session = Depends(get_db),
-    # current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user)
 ):
     source_item = None
     if data.wardrobe_item_id:
         # Ensure the user owns this item
         source_item = db.query(models.WardrobeItem).filter(
             models.WardrobeItem.id == data.wardrobe_item_id,
-            # models.WardrobeItem.user_id == current_user.id
+            models.WardrobeItem.user_id == current_user.id
         ).first()
     elif data.product_id:
         source_item = db.query(models.Product).filter(models.Product.id == data.product_id).first()
@@ -461,13 +459,22 @@ def delete_product(product_id: str, db: Session = Depends(get_db)):
     return {"status": "deleted", "id": product_id}
 
 @app.delete("/wardrobe/{item_id}")
-def delete_wardrobe_item(item_id: str, db: Session = Depends(get_db)):#, current_user: models.User = Depends(get_current_user)):
+def delete_wardrobe_item(
+    item_id: str, 
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
     item = db.query(models.WardrobeItem).filter(
         models.WardrobeItem.id == item_id,
-        # models.WardrobeItem.user_id == current_user.id
+        models.WardrobeItem.user_id == current_user.id 
     ).first()
     
     if not item: raise HTTPException(404, detail="Wardrobe item not found")
+    
+    # Delete from Azure Blob Storage here to save space
+    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=item.image_url.split('/')[-1])
+    blob_client.delete_blob()
+
     db.delete(item)
     db.commit()
     return {"status": "deleted", "id": item_id}
