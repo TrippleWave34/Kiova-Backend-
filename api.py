@@ -3,6 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles 
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional
 import uuid
 from azure.storage.blob import BlobServiceClient, ContentSettings
@@ -351,6 +352,24 @@ def create_product(product: ProductCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_item)
     return db_item
+
+@app.get("/products/top-picks", response_model=List[ProductResponse])
+def get_top_picks(db: Session = Depends(get_db)):
+    return db.query(models.Product).order_by(func.random()).limit(5).all()
+
+@app.get("/products/featured", response_model=List[ProductResponse])
+def get_featured_products(
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    user_styles = [cat.name for cat in current_user.selected_categories]
+    
+    if not user_styles:
+        return db.query(models.Product).order_by(func.random()).limit(20).all()
+
+    return db.query(models.Product).filter(
+        models.Product.style.in_(user_styles)
+    ).limit(20).all()
 
 @app.post("/wardrobe", response_model=WardrobeItemResponse)
 async def add_to_wardrobe(
