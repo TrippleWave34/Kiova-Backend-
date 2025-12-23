@@ -13,3 +13,4 @@ rembg
 pillow
 onnxruntime
 firebase-admin
+transformers

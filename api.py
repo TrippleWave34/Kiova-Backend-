@@ -21,6 +21,9 @@ import base64
 import firebase_admin
 from firebase_admin import auth, credentials
 from contextlib import asynccontextmanager
+import torch
+import numpy as np
+from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation
 
 load_dotenv()
 
@@ -51,6 +54,13 @@ ai_client = AzureOpenAI(
     api_key=AI_KEY,
     api_version="2024-12-01-preview"
 )
+
+MODEL_NAME = "mattmdjaga/segformer_b2_clothes" 
+
+print(f"Loading {MODEL_NAME}...")
+processor = SegformerImageProcessor.from_pretrained(MODEL_NAME)
+model = AutoModelForSemanticSegmentation.from_pretrained(MODEL_NAME)
+print("Model Loaded.")
 
 # models.Base.metadata.drop_all(bind=engine) 
 models.Base.metadata.create_all(bind=engine)
@@ -225,7 +235,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         )
 
 # ==========================================
-# HELPER FUNCTIONS (No changes)
+# HELPER FUNCTIONS 
 # ==========================================
 
 def process_and_upload(file_bytes, filename):
@@ -284,6 +294,88 @@ def get_ai_metadata(image_url: str):
         print(f"Vision Error: {e}")
         raise HTTPException(status_code=500, detail="AI Analysis Failed")
 
+def segment_and_upload(file_bytes, filename):
+    try:
+        # 1. Load Original Image
+        input_image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        
+        # 2. Get High-Quality Cutout using REMBG (The Outline)
+        rembg_output = remove(input_image)
+        rembg_arr = np.array(rembg_output)
+        
+        # 3. Get Semantic Segmentation (The Body Parts)
+        inputs = processor(images=input_image, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+            
+        # Upscale mask to match image size
+        logits = outputs.logits.cpu()
+        upsampled_logits = torch.nn.functional.interpolate(
+            logits,
+            size=input_image.size[::-1],
+            mode="bilinear",
+            align_corners=False,
+        )
+        pred_seg = upsampled_logits.argmax(dim=1)[0] # Keep as Tensor for dilation
+
+        # 4. Define Body Labels to REMOVE
+        # 0:Background, 1:Hat, 2:Hair, 3:Sunglasses, 4:Upper-clothes, 5:Skirt, 
+        # 6:Pants, 7:Dress, 8:Belt, 9:Left-shoe, 10:Right-shoe, 11:Face, 
+        # 12:Left-leg, 13:Right-leg, 14:Left-arm, 15:Right-arm, 16:Bag, 17:Scarf
+        
+        # We remove: Hair(2), Sunglasses(3), Face(11), Legs(12,13), Arms(14,15)
+        body_labels = [2, 3, 11, 12, 13, 14, 15] 
+
+        # Create binary mask (1 where body is, 0 elsewhere)
+        # Using torch operations for speed
+        body_mask = torch.zeros_like(pred_seg, dtype=torch.float32)
+        for label in body_labels:
+            body_mask = torch.where(pred_seg == label, 1.0, body_mask)
+
+        # 5. DILATION (The Secret Sauce)
+        # Expands the body mask by 5-10 pixels to eat up skin edges and halos
+        # We use MaxPool2d as a hacky, fast dilation without needing OpenCV
+        if body_mask.sum() > 0:
+            body_mask = body_mask.unsqueeze(0).unsqueeze(0) # Add batch/channel dims
+            # Kernel size 13 = Dilate by ~6 pixels. Increase if you still see skin edges.
+            dilated_mask = torch.nn.functional.max_pool2d(body_mask, kernel_size=13, stride=1, padding=6)
+            body_mask_np = dilated_mask.squeeze().numpy()
+        else:
+            body_mask_np = body_mask.numpy()
+
+        # 6. Apply to REMBG Output
+        alpha_channel = rembg_arr[:, :, 3]
+        
+        # If the pixel is body (1), make it transparent (0). Otherwise keep rembg alpha.
+        new_alpha = np.where(body_mask_np > 0.5, 0, alpha_channel).astype(np.uint8)
+        
+        rembg_arr[:, :, 3] = new_alpha
+        final_image = Image.fromarray(rembg_arr)
+
+        # 7. Crop to Content
+        bbox = final_image.getbbox()
+        if bbox:
+            final_image = final_image.crop(bbox)
+
+        # 8. Upload
+        output_buffer = io.BytesIO()
+        final_image.save(output_buffer, format="PNG")
+        output_buffer.seek(0)
+        
+        unique_name = f"{uuid.uuid4()}.png"
+        blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=unique_name)
+        blob_client.upload_blob(
+            output_buffer, 
+            content_settings=ContentSettings(content_type='image/png') 
+        )
+        return blob_client.url
+
+    except Exception as e:
+        print(f"Segmentation Error: {e}")
+        # Fallback to simple rembg if AI fails
+        return process_and_upload(file_bytes, filename)
+    
+    
 # ==========================================
 # ENDPOINTS
 # ==========================================
@@ -322,7 +414,7 @@ def complete_onboarding(
 
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
-    image_url = process_and_upload(file.file.read(), file.filename)
+    image_url = segment_and_upload(file.file.read(), file.filename)
     ai_data = get_ai_metadata(image_url)
     ai_data["processed_image_url"] = image_url
     return {"status": "success", "ai_results": ai_data}
@@ -377,7 +469,7 @@ async def add_to_wardrobe(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user) # <--- LOCKED
 ):
-    image_url = process_and_upload(file.file.read(), file.filename)
+    image_url = segment_and_upload(file.file.read(), file.filename)
     meta = get_ai_metadata(image_url)
     
     description = f"{meta.get('gender')} {meta.get('style')} {meta.get('color')} {meta.get('sub_category')} {' '.join(meta.get('tags', []))}"
