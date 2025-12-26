@@ -375,7 +375,7 @@ def segment_and_upload(file_bytes, filename):
         # Fallback to simple rembg if AI fails
         return process_and_upload(file_bytes, filename)
     
-    
+
 # ==========================================
 # ENDPOINTS
 # ==========================================
@@ -509,7 +509,6 @@ def style_me(
 ):
     source_item = None
     if data.wardrobe_item_id:
-        # Ensure the user owns this item
         source_item = db.query(models.WardrobeItem).filter(
             models.WardrobeItem.id == data.wardrobe_item_id,
             models.WardrobeItem.user_id == current_user.id
@@ -518,32 +517,69 @@ def style_me(
         source_item = db.query(models.Product).filter(models.Product.id == data.product_id).first()
         
     if not source_item:
-        raise HTTPException(404, "Item not found or does not belong to you")
+        raise HTTPException(404, "Item not found")
 
+    # 1. Determine Logic based on Category
     target_categories = []
-    if source_item.category == "Top": target_categories = ["Bottom", "Shoes", "Outerwear"]
-    elif source_item.category in ["Bottom", "Pants"]: target_categories = ["Top", "Shoes", "Outerwear"]
-    elif source_item.category == "Shoes": target_categories = ["Top", "Bottom", "Outerwear"]
     
-    target_genders = ["Unisex"]
-    if source_item.gender == "Men":
-        target_genders.append("Men")
-    elif source_item.gender == "Women":
-        target_genders.append("Women")
+    if source_item.category == "Dress":
+        # If source is dress, we only want shoes, accessories, outerwear
+        target_categories = ["Shoes", "Outerwear", "Accessory", "Bag"]
+    elif source_item.category == "Top": 
+        target_categories = ["Bottom", "Shoes", "Outerwear", "Accessory"]
+    elif source_item.category in ["Bottom", "Pants", "Skirt"]: 
+        target_categories = ["Top", "Shoes", "Outerwear", "Accessory"]
+    elif source_item.category == "Shoes": 
+        # Decide between Dress OR Top+Bottom? For now, stick to Top+Bottom defaults
+        target_categories = ["Top", "Bottom", "Outerwear", "Dress"] 
     else:
-        target_genders.extend(["Men", "Women"])
+        # Fallback
+        target_categories = ["Top", "Bottom", "Shoes", "Dress"]
 
+    # 2. Gender Logic
+    target_genders = ["Unisex"]
+    if source_item.gender == "Men": target_genders.append("Men")
+    elif source_item.gender == "Women": target_genders.append("Women")
+    else: target_genders.extend(["Men", "Women"])
+
+    # 3. Fetch Matches
     matches = db.query(models.Product).filter(
         models.Product.category.in_(target_categories),
         models.Product.gender.in_(target_genders),
         models.Product.id != getattr(source_item, 'id', '')
     ).order_by(
         models.Product.embedding.cosine_distance(source_item.embedding)
-    ).limit(5).all()
+    ).limit(10).all() # Fetch more candidates (10 instead of 5)
 
+    # 4. Filter for Logic Conflicts (e.g. No Dress + Pants)
+    final_matches = []
+    categories_present = set()
+    
+    # If source is dress, mark top/bottom as 'taken' so we don't add them
+    if source_item.category == "Dress":
+        categories_present.add("Top")
+        categories_present.add("Bottom")
+    elif source_item.category in ["Top", "Bottom"]:
+        categories_present.add("Dress") # Don't add a dress if we have a shirt/pants source
+
+    for match in matches:
+        cat = match.category
+        
+        # Conflict Resolution
+        if cat == "Dress" and ("Top" in categories_present or "Bottom" in categories_present):
+            continue # Skip dress if we have separates
+        if cat in ["Top", "Bottom"] and "Dress" in categories_present:
+            continue # Skip separates if we have a dress
+
+        # Ensure variety (one per category)
+        if cat not in categories_present:
+            categories_present.add(cat)
+            final_matches.append(match)
+            
+    # Limit to 5 for UI
     return {
         "user_item": source_item,
-        "styled_matches": matches,
+        "styled_matches": final_matches[:5],
         "style_tip": f"Matching {source_item.style} vibes for {source_item.gender}."
     }
 

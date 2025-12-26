@@ -14,3 +14,4 @@ pillow
 onnxruntime
 firebase-admin
 transformers
+azure-storage-blob
