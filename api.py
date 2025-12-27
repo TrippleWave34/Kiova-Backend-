@@ -201,6 +201,16 @@ class CategoryResponse(CategoryBase):
 class UserCategorySelection(BaseModel):
     category_ids: List[int]
 
+class WardrobeBatchCreate(BaseModel):
+    processed_image_url: str
+    category: str = "Unknown"
+    sub_category: str = ""
+    gender: str = "Unisex"
+    color: str = ""
+    pattern: str = ""
+    style: str = ""
+    tags: List[str] = []
+
 # ==========================================
 # AUTHENTICATION DEPENDENCY
 # ==========================================
@@ -600,6 +610,33 @@ async def add_to_wardrobe(
     db.commit()
     db.refresh(new_item)
     return new_item
+
+@app.post("/wardrobe/batch")
+def add_wardrobe_batch(
+    item: WardrobeBatchCreate, 
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    # Vectorize
+    description = f"{item.gender} {item.style} {item.color} {item.sub_category} {' '.join(item.tags)}"
+    vector = get_vector(description)
+
+    new_item = models.WardrobeItem(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        image_url=item.processed_image_url, # Already hosted
+        category=item.category,
+        sub_category=item.sub_category,
+        gender=item.gender,
+        color=item.color,
+        pattern=item.pattern,
+        style=item.style,
+        tags=item.tags,
+        embedding=vector
+    )
+    db.add(new_item)
+    db.commit()
+    return {"status": "saved"}
 
 @app.get("/wardrobe", response_model=List[WardrobeItemResponse])
 def get_wardrobe(
