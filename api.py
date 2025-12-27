@@ -376,6 +376,90 @@ def segment_and_upload(file_bytes, filename):
         return process_and_upload(file_bytes, filename)
     
 
+def segment_and_split(file_bytes):
+    """
+    Returns a list of dicts: [{'image_url': '...', 'category': 'Top', 'label_id': 4}, ...]
+    """
+    try:
+        input_image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        
+        # 1. REMBG for the whole person outline
+        rembg_output = remove(input_image)
+        rembg_arr = np.array(rembg_output)
+        
+        # 2. Segformer for parts
+        inputs = processor(images=input_image, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+            
+        logits = outputs.logits.cpu()
+        upsampled_logits = torch.nn.functional.interpolate(
+            logits, size=input_image.size[::-1], mode="bilinear", align_corners=False
+        )
+        pred_seg = upsampled_logits.argmax(dim=1)[0].numpy()
+
+        # 3. Define Categories to Extract
+        # Map Segformer IDs to readable names
+        # 4:Upper-clothes, 5:Skirt, 6:Pants, 7:Dress, 9:Left-shoe, 10:Right-shoe, 16:Bag, 17:Scarf
+        clothing_map = {
+            4: "Top", 5: "Bottom", 6: "Bottom", 7: "Dress", 
+            9: "Shoes", 10: "Shoes", 16: "Bag", 17: "Accessory"
+        }
+        
+        detected_items = []
+        found_labels = np.unique(pred_seg)
+
+        for label_id in found_labels:
+            if label_id not in clothing_map:
+                continue
+                
+            category_name = clothing_map[label_id]
+            
+            # --- Special Logic for Shoes ---
+            # Merge Left(9) and Right(10) into one "Shoes" item if both exist
+            if label_id == 10 and 9 in found_labels:
+                continue # Skip right shoe, we handle it with left shoe
+            
+            mask_ids = [label_id]
+            if label_id == 9: mask_ids.append(10) # Grab both shoes
+            
+            # Create Mask for this specific item
+            item_mask = np.isin(pred_seg, mask_ids).astype(np.uint8) * 255
+            
+            # Apply to REMBG alpha
+            alpha_channel = rembg_arr[:, :, 3]
+            new_alpha = np.where(item_mask > 0, alpha_channel, 0).astype(np.uint8)
+            
+            item_arr = rembg_arr.copy()
+            item_arr[:, :, 3] = new_alpha
+            final_item_img = Image.fromarray(item_arr)
+            
+            # Crop to content
+            bbox = final_item_img.getbbox()
+            if bbox:
+                final_item_img = final_item_img.crop(bbox)
+                
+                # Upload
+                output_buffer = io.BytesIO()
+                final_item_img.save(output_buffer, format="PNG")
+                output_buffer.seek(0)
+                
+                unique_name = f"{uuid.uuid4()}.png"
+                blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=unique_name)
+                blob_client.upload_blob(output_buffer, content_settings=ContentSettings(content_type='image/png'))
+                
+                detected_items.append({
+                    "image_url": blob_client.url,
+                    "category": category_name, # Rough category from Segformer
+                    "confidence": 0.95 # Mock confidence
+                })
+                
+        return detected_items
+
+    except Exception as e:
+        print(f"Split Error: {e}")
+        return []
+
 # ==========================================
 # ENDPOINTS
 # ==========================================
@@ -418,6 +502,29 @@ async def analyze_image(file: UploadFile = File(...)):
     ai_data = get_ai_metadata(image_url)
     ai_data["processed_image_url"] = image_url
     return {"status": "success", "ai_results": ai_data}
+
+@app.post("/analyze-image-multi")
+async def analyze_image_multi(file: UploadFile = File(...)):
+    # 1. Split image into parts
+    file_bytes = file.file.read()
+    split_items = segment_and_split(file_bytes)
+    
+    if not split_items:
+        # Fallback: If nothing detected, return original as one item
+        # Reset file pointer or re-read? Better to pass bytes.
+        # For simplicity, we just return error or fallback logic here.
+        # Let's assume we reuse the single-item logic as fallback.
+        url = segment_and_upload(file_bytes, file.filename)
+        return {"status": "fallback", "items": [{"image_url": url, "category": "Unknown"}]}
+
+    # 2. Run AI Analysis on EACH part (to get detailed tags/colors)
+    final_results = []
+    for item in split_items:
+        meta = get_ai_metadata(item['image_url']) # GPT-4o analyzes the cropped part
+        meta['processed_image_url'] = item['image_url']
+        final_results.append(meta)
+
+    return {"status": "success", "items": final_results}
 
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, db: Session = Depends(get_db)):
