@@ -24,6 +24,8 @@ from contextlib import asynccontextmanager
 import torch
 import numpy as np
 from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation
+import stripe
+from fastapi import Request 
 
 load_dotenv()
 
@@ -35,6 +37,8 @@ AI_KEY = os.getenv("AZURE_AI_KEY")
 DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT", "o4-mini")
 DEPLOYMENT_EMBEDDING = os.getenv("AZURE_DEPLOYMENT_EMBEDDING", "text-embedding-3-small")
 FIREBASE_CREDS_B64 = os.getenv("FIREBASE_CREDENTIALS_BASE64")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+stripe.api_key = STRIPE_SECRET_KEY
 
 if not firebase_admin._apps:
     try:
@@ -869,3 +873,102 @@ def delete_category(
     db.delete(db_category)
     db.commit()
     return
+
+# --- PAYMENT ENDPOINTS ---
+
+@app.post("/create-checkout-session")
+def create_checkout_session(
+    product_id: str, 
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    product = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not product: raise HTTPException(404, "Product not found")
+
+    try:
+        # Create Stripe Session
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd',
+                    'product_data': {'name': product.name, 'images': product.image_urls[:1] if product.image_urls else []},
+                    'unit_amount': int(product.price * 100), # Cents
+                },
+                'quantity': 1,
+            }],
+            mode='payment',
+            
+            # CRITICAL: Ask Stripe to collect the address for us
+            shipping_address_collection={
+                'allowed_countries': ['US', 'CA', 'GB', 'DE', 'FR'], # Add your supported countries
+            },
+            
+            success_url='http://localhost:5000/success', # Flutter handles this via deep link usually, but for now simple URL
+            cancel_url='http://localhost:5000/cancel',
+            
+            # Store metadata so we know what this payment is for in the webhook
+            metadata={
+                'product_id': product.id,
+                'buyer_id': current_user.id,
+                'seller_id': "user_12345" # TODO: Fetch real seller ID from Product relationship if you have it
+            }
+        )
+        return {"checkout_url": session.url}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
+    payload = await request.body()
+    sig_header = request.headers.get('stripe-signature')
+    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET") # Get this from CLI
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, endpoint_secret
+        )
+    except ValueError as e:
+        raise HTTPException(400, "Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        raise HTTPException(400, "Invalid signature")
+
+    # Handle the event
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        
+        # Extract data
+        meta = session.get('metadata', {})
+        shipping = session.get('shipping_details', {})
+        
+        # Create Order in DB
+        new_order = models.Order(
+            id=session['id'],
+            product_id=meta.get('product_id'),
+            buyer_id=meta.get('buyer_id'),
+            seller_id=meta.get('seller_id'),
+            amount=session['amount_total'] / 100,
+            status="PAID",
+            shipping_details=shipping
+        )
+        db.add(new_order)
+        db.commit()
+        print("✅ Order saved successfully!")
+
+    return {"status": "success"}
+
+# --- SELLER ENDPOINTS ---
+
+@app.get("/orders/selling", response_model=List[dict]) # Use a Pydantic schema for production
+def get_seller_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    # Seller needs to see what to ship
+    # TODO: In real app, link products to seller_id. 
+    # For now, we return all orders so you can test viewing them.
+    orders = db.query(models.Order).all() 
+    return [{
+        "id": o.id, 
+        "product": o.product.name, 
+        "amount": o.amount, 
+        "status": o.status,
+        "shipping": o.shipping_details
+    } for o in orders]

@@ -71,3 +71,23 @@ class WardrobeItem(Base):
     gender = Column(String, nullable=True) 
     tags = Column(JSON)
     embedding = Column(Vector(1536))
+
+class Order(Base):
+    __tablename__ = "orders"
+    
+    id = Column(String, primary_key=True, index=True) # Stripe Session ID or UUID
+    product_id = Column(String, ForeignKey("products.id"))
+    buyer_id = Column(String, ForeignKey("users.id"))
+    seller_id = Column(String, ForeignKey("users.id")) # We need to know who to pay later
+    
+    amount = Column(Float)
+    status = Column(String, default="PENDING") # PENDING, PAID, SHIPPED, DELIVERED, PAYOUT_COMPLETE
+    
+    # Stripe collects address, we store it here
+    shipping_details = Column(JSON) 
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    # Relationships
+    product = relationship("Product")
+    buyer = relationship("User", foreign_keys=[buyer_id])
+    seller = relationship("User", foreign_keys=[seller_id])
