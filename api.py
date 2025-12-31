@@ -541,13 +541,16 @@ async def analyze_image_multi(file: UploadFile = File(...)):
     return {"status": "success", "items": final_results}
 
 @app.post("/products", response_model=ProductResponse)
-def create_product(product: ProductCreate, db: Session = Depends(get_db)):
+def create_product(product: ProductCreate, 
+                   db: Session = Depends(get_db),
+                   current_user: models.User = Depends(get_current_user)):
     new_id = str(uuid.uuid4())
     description = f"{product.gender} {product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
     vector = get_vector(description)
     
     db_item = models.Product(
         id=new_id,
+        user_id=current_user.id,
         name=product.name,
         price=product.price,
         image_urls=product.image_urls,
@@ -911,7 +914,7 @@ def create_checkout_session(
             metadata={
                 'product_id': product.id,
                 'buyer_id': current_user.id,
-                'seller_id': "user_12345" # TODO: Fetch real seller ID from Product relationship if you have it
+                'seller_id': product.user_id
             }
         )
         return {"checkout_url": session.url}
@@ -972,3 +975,37 @@ def get_seller_orders(db: Session = Depends(get_db), current_user: models.User =
         "status": o.status,
         "shipping": o.shipping_details
     } for o in orders]
+
+@app.get("/orders/selling")
+def get_seller_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    orders = db.query(models.Order).filter(models.Order.seller_id == current_user.id).all()
+    return orders
+
+@app.post("/orders/{order_id}/ship")
+def mark_order_shipped(order_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    order = db.query(models.Order).filter(models.Order.id == order_id, models.Order.seller_id == current_user.id).first()
+    if not order: raise HTTPException(404, "Order not found")
+    
+    order.status = "SHIPPED"
+    db.commit()
+    return {"status": "SHIPPED"}
+
+# --- ADMIN: View All Orders ---
+@app.get("/admin/orders")
+def get_all_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(403, "Not an Admin")
+    return db.query(models.Order).all()
+
+# --- ADMIN: Mark Payout Complete ---
+@app.post("/admin/orders/{order_id}/payout")
+def mark_order_paid_out(order_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(403, "Not an Admin")
+    
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order: raise HTTPException(404, "Order not found")
+    
+    order.status = "COMPLETED" # Payout sent to seller
+    db.commit()
+    return {"status": "COMPLETED"}

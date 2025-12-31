@@ -17,6 +17,7 @@ class User(Base):
     full_name = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     has_completed_onboarding = Column(Boolean, default=False) 
+    is_admin = Column(Boolean, default=False) 
 
     # --- UPDATE: Add relationship to categories ---
     selected_categories = relationship(
@@ -42,6 +43,7 @@ class Category(Base):
 class Product(Base):
     __tablename__ = "products"
     id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id")) 
     name = Column(String)
     price = Column(Float)
     image_urls = Column(JSON) 
@@ -75,13 +77,13 @@ class WardrobeItem(Base):
 class Order(Base):
     __tablename__ = "orders"
     
-    id = Column(String, primary_key=True, index=True) # Stripe Session ID or UUID
+    id = Column(String, primary_key=True, index=True) 
     product_id = Column(String, ForeignKey("products.id"))
     buyer_id = Column(String, ForeignKey("users.id"))
-    seller_id = Column(String, ForeignKey("users.id")) # We need to know who to pay later
+    seller_id = Column(String, ForeignKey("users.id"))
     
     amount = Column(Float)
-    status = Column(String, default="PENDING") # PENDING, PAID, SHIPPED, DELIVERED, PAYOUT_COMPLETE
+    status = Column(String, default="PAID") # PAID, SHIPPED, COMPLETED
     
     # Stripe collects address, we store it here
     shipping_details = Column(JSON) 
