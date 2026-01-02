@@ -1081,23 +1081,27 @@ def get_all_orders(db: Session = Depends(get_db), current_user: models.User = De
     
     orders = db.query(models.Order).all()
     
-    # Manual mapping to ensure 'product' field is populated correctly
     result = []
     for o in orders:
-        # Try to get the name, fallback to ID if product is missing/deleted
-        p_name = "Unknown"
-        if o.product:
-            p_name = o.product.name
-        elif o.product_id:
-            p_name = f"ID: {o.product_id}"
-            
+        # Get Product Name
+        p_name = o.product.name if o.product else f"ID: {o.product_id}"
+        
+        # --- FIX: Get Seller Email ---
+        seller_email = "Unknown"
+        if o.seller_id:
+            seller = db.query(models.User).filter(models.User.id == o.seller_id).first()
+            if seller:
+                seller_email = seller.email
+        # -----------------------------
+
         result.append({
             "id": o.id,
-            "product": p_name, # <--- This sends the string the UI expects
+            "product": p_name,
             "amount": o.amount,
             "status": o.status,
-            "shipping": o.shipping_details, # Ensure this matches frontend key
-            "seller_id": o.seller_id
+            "shipping": o.shipping_details,
+            "seller_id": o.seller_id,
+            "seller_email": seller_email # <--- Sending this to UI
         })
         
     return result
