@@ -587,17 +587,14 @@ def create_product(product: ProductCreate,
 @app.get("/products/top-picks", response_model=List[ProductResponse])
 def get_top_picks(
     db: Session = Depends(get_db),
-    # 1. Add this so we know who is asking (can be None if guest)
     current_user: Optional[models.User] = Depends(get_current_user_optional)
 ):
-    # 2. Filter out Sold items
     sold_ids = db.query(models.Order.product_id).filter(
         models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
     ).subquery()
     
     query = db.query(models.Product).filter(models.Product.id.notin_(sold_ids))
     
-    # 3. Filter out Own items (if logged in)
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
         
@@ -816,9 +813,7 @@ def get_my_products(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user) # Requires strict login
 ):
-    # Return products where user_id matches the logged-in user
     return db.query(models.Product).filter(models.Product.user_id == current_user.id).all()
-
 
 @app.put("/products/{product_id}", response_model=ProductResponse)
 def update_product(product_id: str, updates: ProductUpdate, db: Session = Depends(get_db)):
