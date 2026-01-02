@@ -248,6 +248,20 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+def get_current_user_optional(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security), 
+    db: Session = Depends(get_db)
+):
+    if not credentials:
+        return None
+    try:
+        token = credentials.credentials
+        decoded_token = auth.verify_id_token(token)
+        uid = decoded_token['uid']
+        return db.query(models.User).filter(models.User.id == uid).first()
+    except:
+        return None
+
 # ==========================================
 # HELPER FUNCTIONS 
 # ==========================================
@@ -570,22 +584,38 @@ def create_product(product: ProductCreate,
     return db_item
 
 @app.get("/products/top-picks", response_model=List[ProductResponse])
-def get_top_picks(db: Session = Depends(get_db)):
-    return db.query(models.Product).order_by(func.random()).limit(5).all()
+def get_top_picks(
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(get_current_user_optional)
+):
+    sold_ids = db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])).subquery()
+    
+    query = db.query(models.Product).filter(models.Product.id.notin_(sold_ids))
+    
+    if current_user:
+        query = query.filter(models.Product.user_id != current_user.id)
+        
+    return query.order_by(func.random()).limit(5).all()
 
 @app.get("/products/featured", response_model=List[ProductResponse])
 def get_featured_products(
     db: Session = Depends(get_db), 
     current_user: models.User = Depends(get_current_user)
 ):
+    # Filter Sold
+    sold_ids = db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])).subquery()
+    
     user_styles = [cat.name for cat in current_user.selected_categories]
     
-    if not user_styles:
-        return db.query(models.Product).order_by(func.random()).limit(20).all()
+    query = db.query(models.Product).filter(
+        models.Product.id.notin_(sold_ids),
+        models.Product.user_id != current_user.id # Filter Own
+    )
 
-    return db.query(models.Product).filter(
-        models.Product.style.in_(user_styles)
-    ).limit(20).all()
+    if not user_styles:
+        return query.order_by(func.random()).limit(20).all()
+
+    return query.filter(models.Product.style.in_(user_styles)).limit(20).all()
 
 @app.post("/wardrobe", response_model=WardrobeItemResponse)
 async def add_to_wardrobe(
@@ -694,13 +724,20 @@ def style_me(
     else: target_genders.extend(["Men", "Women"])
 
     # 3. Fetch Matches
+
+    sold_product_ids = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
+    ).subquery()
+
     matches = db.query(models.Product).filter(
         models.Product.category.in_(target_categories),
         models.Product.gender.in_(target_genders),
-        models.Product.id != getattr(source_item, 'id', '')
+        models.Product.id != getattr(source_item, 'id', ''),
+        models.Product.id.notin_(sold_product_ids),     
+        models.Product.user_id != current_user.id        
     ).order_by(
         models.Product.embedding.cosine_distance(source_item.embedding)
-    ).limit(10).all() # Fetch more candidates (10 instead of 5)
+    ).limit(10).all()
 
     # 4. Filter for Logic Conflicts (e.g. No Dress + Pants)
     final_matches = []
@@ -735,15 +772,38 @@ def style_me(
     }
 
 @app.get("/products", response_model=List[ProductResponse])
-def get_products(category: Optional[str] = None, gender: Optional[str] = None, search: Optional[str] = None, db: Session = Depends(get_db)):
+def get_products(
+    category: Optional[str] = None, 
+    gender: Optional[str] = None, 
+    search: Optional[str] = None, 
+    db: Session = Depends(get_db),
+    # Use the new optional dependency
+    current_user: Optional[models.User] = Depends(get_current_user_optional) 
+):
     query = db.query(models.Product)
-    if category: query = query.filter(models.Product.category == category)
-    if gender: query = query.filter(models.Product.gender.in_([gender, "Unisex"]))
+
+    # 1. Hide Sold Products
+    # Find all product IDs that are in active orders
+    sold_product_ids = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
+    ).subquery()
+    
+    query = query.filter(models.Product.id.notin_(sold_product_ids))
+
+    # 2. Hide Own Products (If logged in)
+    if current_user:
+        query = query.filter(models.Product.user_id != current_user.id)
+
+    # 3. Standard Filters
+    if category: 
+        query = query.filter(models.Product.category == category)
+    if gender: 
+        query = query.filter(models.Product.gender.in_([gender, "Unisex"]))
     if search:
         search_term = f"%{search}%"
         query = query.filter(models.Product.name.ilike(search_term))
+        
     return query.all()
-
 @app.put("/products/{product_id}", response_model=ProductResponse)
 def update_product(product_id: str, updates: ProductUpdate, db: Session = Depends(get_db)):
     item = db.query(models.Product).filter(models.Product.id == product_id).first()
@@ -907,8 +967,8 @@ def create_checkout_session(
                 'allowed_countries': ['US', 'CA', 'GB', 'DE', 'FR'], # Add your supported countries
             },
             
-            success_url='http://localhost:5000/success', # Flutter handles this via deep link usually, but for now simple URL
-            cancel_url='http://localhost:5000/cancel',
+            success_url= os.getenv("FRONTEND_URL") + '/success', 
+            cancel_url= os.getenv("FRONTEND_URL") + '/cancel',
             
             # Store metadata so we know what this payment is for in the webhook
             metadata={
@@ -962,19 +1022,31 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
 # --- SELLER ENDPOINTS ---
 
-@app.get("/orders/selling", response_model=List[dict]) # Use a Pydantic schema for production
+@app.get("/orders/selling")
 def get_seller_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    # Seller needs to see what to ship
-    # TODO: In real app, link products to seller_id. 
-    # For now, we return all orders so you can test viewing them.
-    orders = db.query(models.Order).all() 
-    return [{
-        "id": o.id, 
-        "product": o.product.name, 
-        "amount": o.amount, 
-        "status": o.status,
-        "shipping": o.shipping_details
-    } for o in orders]
+    # 1. Filter: Only get orders where the current user is the SELLER
+    orders = db.query(models.Order).filter(models.Order.seller_id == current_user.id).all()
+    
+    # 2. Map results safely
+    result = []
+    for o in orders:
+        # Safe Product Name check
+        p_name = "Unknown Product"
+        if o.product:
+            p_name = o.product.name
+        elif o.product_id:
+            # Fallback if the product row was deleted but order exists
+            p_name = f"Product (ID: {o.product_id})"
+
+        result.append({
+            "id": o.id, 
+            "product": p_name, 
+            "amount": o.amount, 
+            "status": o.status,
+            "shipping": o.shipping_details
+        })
+    
+    return result
 
 @app.get("/orders/selling")
 def get_seller_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
@@ -995,7 +1067,29 @@ def mark_order_shipped(order_id: str, db: Session = Depends(get_db), current_use
 def get_all_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     if not current_user.is_admin:
         raise HTTPException(403, "Not an Admin")
-    return db.query(models.Order).all()
+    
+    orders = db.query(models.Order).all()
+    
+    # Manual mapping to ensure 'product' field is populated correctly
+    result = []
+    for o in orders:
+        # Try to get the name, fallback to ID if product is missing/deleted
+        p_name = "Unknown"
+        if o.product:
+            p_name = o.product.name
+        elif o.product_id:
+            p_name = f"ID: {o.product_id}"
+            
+        result.append({
+            "id": o.id,
+            "product": p_name, # <--- This sends the string the UI expects
+            "amount": o.amount,
+            "status": o.status,
+            "shipping": o.shipping_details, # Ensure this matches frontend key
+            "seller_id": o.seller_id
+        })
+        
+    return result
 
 # --- ADMIN: Mark Payout Complete ---
 @app.post("/admin/orders/{order_id}/payout")
