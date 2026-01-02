@@ -121,6 +121,7 @@ INITIAL_CATEGORIES = [
 ]
 
 security = HTTPBearer()
+security_optional = HTTPBearer(auto_error=False) 
 
 # --- PYDANTIC SCHEMAS ---
 
@@ -249,7 +250,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         )
 
 def get_current_user_optional(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security), 
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_optional), 
     db: Session = Depends(get_db)
 ):
     if not credentials:
@@ -557,7 +558,7 @@ async def analyze_image_multi(file: UploadFile = File(...)):
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, 
                    db: Session = Depends(get_db),
-                   current_user: models.User = Depends(get_current_user)):
+                   current_user: models.User = Depends(get_current_user_optional)):
     new_id = str(uuid.uuid4())
     description = f"{product.gender} {product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
     vector = get_vector(description)
@@ -586,12 +587,17 @@ def create_product(product: ProductCreate,
 @app.get("/products/top-picks", response_model=List[ProductResponse])
 def get_top_picks(
     db: Session = Depends(get_db),
+    # 1. Add this so we know who is asking (can be None if guest)
     current_user: Optional[models.User] = Depends(get_current_user_optional)
 ):
-    sold_ids = db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])).subquery()
+    # 2. Filter out Sold items
+    sold_ids = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
+    ).subquery()
     
     query = db.query(models.Product).filter(models.Product.id.notin_(sold_ids))
     
+    # 3. Filter out Own items (if logged in)
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
         
@@ -600,7 +606,7 @@ def get_top_picks(
 @app.get("/products/featured", response_model=List[ProductResponse])
 def get_featured_products(
     db: Session = Depends(get_db), 
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user_optional)
 ):
     # Filter Sold
     sold_ids = db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])).subquery()
@@ -804,6 +810,16 @@ def get_products(
         query = query.filter(models.Product.name.ilike(search_term))
         
     return query.all()
+
+@app.get("/products/me", response_model=List[ProductResponse])
+def get_my_products(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user) # Requires strict login
+):
+    # Return products where user_id matches the logged-in user
+    return db.query(models.Product).filter(models.Product.user_id == current_user.id).all()
+
+
 @app.put("/products/{product_id}", response_model=ProductResponse)
 def update_product(product_id: str, updates: ProductUpdate, db: Session = Depends(get_db)):
     item = db.query(models.Product).filter(models.Product.id == product_id).first()
