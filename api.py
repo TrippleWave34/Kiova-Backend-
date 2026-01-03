@@ -801,24 +801,20 @@ def get_products(
     gender: Optional[str] = None, 
     search: Optional[str] = None, 
     db: Session = Depends(get_db),
-    # Use the new optional dependency
     current_user: Optional[models.User] = Depends(get_current_user_optional) 
 ):
     query = db.query(models.Product)
 
-    # 1. Hide Sold Products
-    # Find all product IDs that are in active orders
     sold_product_ids = db.query(models.Order.product_id).filter(
-        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
-    ).subquery()
+        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"]),
+        models.Order.product_id.isnot(None)
+    ).scalar_subquery()
     
     query = query.filter(models.Product.id.notin_(sold_product_ids))
 
-    # 2. Hide Own Products (If logged in)
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
 
-    # 3. Standard Filters
     if category: 
         query = query.filter(models.Product.category == category)
     if gender: 
@@ -1017,7 +1013,7 @@ def create_checkout_session(
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     payload = await request.body()
     sig_header = request.headers.get('stripe-signature')
-    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET") # Get this from CLI
+    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET") 
 
     try:
         event = stripe.Webhook.construct_event(
@@ -1028,15 +1024,16 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     except stripe.error.SignatureVerificationError as e:
         raise HTTPException(400, "Invalid signature")
 
-    # Handle the event
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
-        
-        # Extract data
         meta = session.get('metadata', {})
-        shipping = session.get('shipping_details', {})
         
-        # Create Order in DB
+        shipping = session.get('shipping_details')
+        if not shipping:
+            shipping = session.get('customer_details')
+
+        print(f"📦 Saving Address: {shipping}") # Debug Log
+
         new_order = models.Order(
             id=session['id'],
             product_id=meta.get('product_id'),
@@ -1044,7 +1041,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
             seller_id=meta.get('seller_id'),
             amount=session['amount_total'] / 100,
             status="PAID",
-            shipping_details=shipping
+            shipping_details=shipping 
         )
         db.add(new_order)
         db.commit()
@@ -1056,18 +1053,14 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/orders/selling")
 def get_seller_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    # 1. Filter: Only get orders where the current user is the SELLER
     orders = db.query(models.Order).filter(models.Order.seller_id == current_user.id).all()
     
-    # 2. Map results safely
     result = []
     for o in orders:
-        # Safe Product Name check
         p_name = "Unknown Product"
         if o.product:
             p_name = o.product.name
         elif o.product_id:
-            # Fallback if the product row was deleted but order exists
             p_name = f"Product (ID: {o.product_id})"
 
         result.append({
@@ -1075,7 +1068,7 @@ def get_seller_orders(db: Session = Depends(get_db), current_user: models.User =
             "product": p_name, 
             "amount": o.amount, 
             "status": o.status,
-            "shipping": o.shipping_details
+            "shipping_details": o.shipping_details 
         })
     
     return result
@@ -1134,29 +1127,30 @@ def get_all_orders(db: Session = Depends(get_db), current_user: models.User = De
         raise HTTPException(403, "Not an Admin")
     
     orders = db.query(models.Order).all()
-    result = []
     
+    result = []
     for o in orders:
         p_name = o.product.name if o.product else f"ID: {o.product_id}"
         
         seller_email = "Unknown"
-        seller_payout = "No Info Provided" 
+        seller_payout = "No Info"
         
         if o.seller_id:
             seller = db.query(models.User).filter(models.User.id == o.seller_id).first()
             if seller:
                 seller_email = seller.email
                 if seller.payout_info:
-                    seller_payout = seller.payout_info 
+                    seller_payout = seller.payout_info
 
         result.append({
             "id": o.id,
             "product": p_name,
             "amount": o.amount,
             "status": o.status,
-            "shipping": o.shipping_details,
+            "shipping_details": o.shipping_details, 
+            "seller_id": o.seller_id,
             "seller_email": seller_email,
-            "seller_payout_info": seller_payout 
+            "seller_payout_info": seller_payout
         })
         
     return result
