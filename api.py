@@ -129,7 +129,8 @@ class UserSchema(BaseModel):
     id: str
     email: str
     full_name: Optional[str] = None
-    has_completed_onboarding: Optional[bool] = False     
+    has_completed_onboarding: Optional[bool] = False
+    payout_info: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -215,6 +216,13 @@ class WardrobeBatchCreate(BaseModel):
     pattern: str = ""
     style: str = ""
     tags: List[str] = []
+
+class PayoutInfoUpdate(BaseModel):
+    info: str
+
+class ShipOrderRequest(BaseModel):
+    tracking_number: str
+    carrier: str
 
 # ==========================================
 # AUTHENTICATION DEPENDENCY
@@ -525,6 +533,16 @@ def complete_onboarding(
     db.refresh(current_user)
     return current_user
 
+@app.put("/users/me/payout-info")
+def update_payout_info(
+    data: PayoutInfoUpdate, 
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    current_user.payout_info = data.info
+    db.commit()
+    return {"status": "updated"}
+
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
     image_url = segment_and_upload(file.file.read(), file.filename)
@@ -559,6 +577,9 @@ async def analyze_image_multi(file: UploadFile = File(...)):
 def create_product(product: ProductCreate, 
                    db: Session = Depends(get_db),
                    current_user: models.User = Depends(get_current_user_optional)):
+    if not current_user.payout_info:
+        raise HTTPException(status_code=400, detail="You must set up Payout Details in Settings before listing an item.")
+    
     new_id = str(uuid.uuid4())
     description = f"{product.gender} {product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
     vector = get_vector(description)
@@ -1065,13 +1086,46 @@ def get_seller_orders(db: Session = Depends(get_db), current_user: models.User =
     return orders
 
 @app.post("/orders/{order_id}/ship")
-def mark_order_shipped(order_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+def mark_order_shipped(
+    order_id: str, 
+    data: ShipOrderRequest,
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
     order = db.query(models.Order).filter(models.Order.id == order_id, models.Order.seller_id == current_user.id).first()
     if not order: raise HTTPException(404, "Order not found")
     
     order.status = "SHIPPED"
+    order.tracking_number = data.tracking_number
+    order.carrier = data.carrier
     db.commit()
     return {"status": "SHIPPED"}
+
+@app.post("/orders/{order_id}/receive")
+def mark_order_received(
+    order_id: str, 
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    # Only the BUYER can mark it as received
+    order = db.query(models.Order).filter(models.Order.id == order_id, models.Order.buyer_id == current_user.id).first()
+    if not order: raise HTTPException(404, "Order not found")
+    
+    order.status = "RECEIVED" 
+    db.commit()
+    return {"status": "RECEIVED"}
+
+@app.get("/orders/buying")
+def get_buyer_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    orders = db.query(models.Order).filter(models.Order.buyer_id == current_user.id).all()
+    return [{
+        "id": o.id, 
+        "product": o.product.name if o.product else "Unknown", 
+        "amount": o.amount, 
+        "status": o.status,
+        "tracking_number": o.tracking_number,
+        "carrier": o.carrier
+    } for o in orders]
 
 # --- ADMIN: View All Orders ---
 @app.get("/admin/orders")
@@ -1080,19 +1134,20 @@ def get_all_orders(db: Session = Depends(get_db), current_user: models.User = De
         raise HTTPException(403, "Not an Admin")
     
     orders = db.query(models.Order).all()
-    
     result = []
+    
     for o in orders:
-        # Get Product Name
         p_name = o.product.name if o.product else f"ID: {o.product_id}"
         
-        # --- FIX: Get Seller Email ---
         seller_email = "Unknown"
+        seller_payout = "No Info Provided" 
+        
         if o.seller_id:
             seller = db.query(models.User).filter(models.User.id == o.seller_id).first()
             if seller:
                 seller_email = seller.email
-        # -----------------------------
+                if seller.payout_info:
+                    seller_payout = seller.payout_info 
 
         result.append({
             "id": o.id,
@@ -1100,8 +1155,8 @@ def get_all_orders(db: Session = Depends(get_db), current_user: models.User = De
             "amount": o.amount,
             "status": o.status,
             "shipping": o.shipping_details,
-            "seller_id": o.seller_id,
-            "seller_email": seller_email # <--- Sending this to UI
+            "seller_email": seller_email,
+            "seller_payout_info": seller_payout 
         })
         
     return result

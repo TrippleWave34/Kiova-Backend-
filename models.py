@@ -18,6 +18,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     has_completed_onboarding = Column(Boolean, default=False) 
     is_admin = Column(Boolean, default=False) 
+    payout_info = Column(String, nullable=True)
 
     # --- UPDATE: Add relationship to categories ---
     selected_categories = relationship(
@@ -88,6 +89,9 @@ class Order(Base):
     # Stripe collects address, we store it here
     shipping_details = Column(JSON) 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    tracking_number = Column(String, nullable=True)
+    carrier = Column(String, nullable=True)
 
     # Relationships
     product = relationship("Product")
