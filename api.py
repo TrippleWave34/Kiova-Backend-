@@ -160,6 +160,7 @@ class ProductUpdate(BaseModel):
 
 class ProductResponse(ProductCreate):
     id: str
+    status: str = "AVAILABLE"
     class Config:
         from_attributes = True
 
@@ -223,6 +224,9 @@ class PayoutInfoUpdate(BaseModel):
 class ShipOrderRequest(BaseModel):
     tracking_number: str
     carrier: str
+
+class OrderStatusUpdate(BaseModel):
+    status: str
 
 # ==========================================
 # AUTHENTICATION DEPENDENCY
@@ -496,6 +500,44 @@ def segment_and_split(file_bytes):
     except Exception as e:
         print(f"Split Error: {e}")
         return []
+    
+
+def transfer_to_wardrobe(db: Session, order: models.Order):
+    """
+    Clones the sold Product into the Buyer's Wardrobe.
+    """
+    product = order.product
+    if not product: 
+        return
+    
+    # 1. Get primary image
+    main_image = product.image_urls[0] if product.image_urls else ""
+
+    # 2. Check if already added (Prevent duplicates if Admin clicks Pay after Buyer clicks Receive)
+    exists = db.query(models.WardrobeItem).filter(
+        models.WardrobeItem.user_id == order.buyer_id,
+        models.WardrobeItem.image_url == main_image
+    ).first()
+    
+    if exists:
+        return
+
+    # 3. Create Wardrobe Item
+    new_item = models.WardrobeItem(
+        id=str(uuid.uuid4()),
+        user_id=order.buyer_id,
+        image_url=main_image,
+        category=product.category,
+        sub_category=product.sub_category,
+        gender=product.gender,
+        color=product.color,
+        pattern=product.pattern,
+        style=product.style,
+        tags=product.tags,
+        embedding=product.embedding 
+    )
+    db.add(new_item)
+    # Note: We don't commit here, we let the parent endpoint commit.
 
 # ==========================================
 # ENDPOINTS
@@ -610,11 +652,15 @@ def get_top_picks(
     db: Session = Depends(get_db),
     current_user: Optional[models.User] = Depends(get_current_user_optional)
 ):
-    sold_ids = db.query(models.Order.product_id).filter(
-        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
-    ).subquery()
-    
-    query = db.query(models.Product).filter(models.Product.id.notin_(sold_ids))
+    sold_orders = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]),
+        models.Order.product_id.isnot(None)
+    ).all()
+    sold_ids = [row[0] for row in sold_orders]
+
+    query = db.query(models.Product)
+    if sold_ids:
+        query = query.filter(models.Product.id.notin_(sold_ids))
     
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
@@ -626,15 +672,22 @@ def get_featured_products(
     db: Session = Depends(get_db), 
     current_user: models.User = Depends(get_current_user_optional)
 ):
-    # Filter Sold
-    sold_ids = db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])).subquery()
     
-    user_styles = [cat.name for cat in current_user.selected_categories]
+    sold_orders = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]),
+        models.Order.product_id.isnot(None)
+    ).all()
+    sold_ids = [row[0] for row in sold_orders]
     
-    query = db.query(models.Product).filter(
-        models.Product.id.notin_(sold_ids),
-        models.Product.user_id != current_user.id # Filter Own
-    )
+    query = db.query(models.Product)
+    if sold_ids:
+        query = query.filter(models.Product.id.notin_(sold_ids))
+        
+    if current_user:
+        query = query.filter(models.Product.user_id != current_user.id)
+
+    # Personalization Logic
+    user_styles = [cat.name for cat in current_user.selected_categories] if current_user else []
 
     if not user_styles:
         return query.order_by(func.random()).limit(20).all()
@@ -805,20 +858,21 @@ def get_products(
 ):
     query = db.query(models.Product)
 
-    sold_product_ids = db.query(models.Order.product_id).filter(
-        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"]),
+    sold_orders = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]), # Added RECEIVED
         models.Order.product_id.isnot(None)
-    ).scalar_subquery()
+    ).all()
     
-    query = query.filter(models.Product.id.notin_(sold_product_ids))
+    sold_ids = [row[0] for row in sold_orders] # Convert to Python list
+    
+    if sold_ids:
+        query = query.filter(models.Product.id.notin_(sold_ids))
 
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
 
-    if category: 
-        query = query.filter(models.Product.category == category)
-    if gender: 
-        query = query.filter(models.Product.gender.in_([gender, "Unisex"]))
+    if category: query = query.filter(models.Product.category == category)
+    if gender: query = query.filter(models.Product.gender.in_([gender, "Unisex"]))
     if search:
         search_term = f"%{search}%"
         query = query.filter(models.Product.name.ilike(search_term))
@@ -828,9 +882,33 @@ def get_products(
 @app.get("/products/me", response_model=List[ProductResponse])
 def get_my_products(
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user) # Requires strict login
+    current_user: models.User = Depends(get_current_user)
 ):
-    return db.query(models.Product).filter(models.Product.user_id == current_user.id).all()
+    # 1. Get all my products
+    products = db.query(models.Product).filter(models.Product.user_id == current_user.id).all()
+    
+    # 2. Get all orders where I am the seller
+    sales = db.query(models.Order).filter(models.Order.seller_id == current_user.id).all()
+    
+    # 3. Create a map: {product_id: 'PAID'}
+    product_status_map = {order.product_id: order.status for order in sales}
+
+    # 4. Attach status to response manually
+    results = []
+    for p in products:
+        # We convert the ORM object to the Pydantic model to inject the status
+        # (Since the ORM object might not have a 'status' column in the products table)
+        p_data = ProductResponse.model_validate(p)
+        
+        # Check if this product ID exists in our sales map
+        if p.id in product_status_map:
+             p_data.status = product_status_map[p.id] # e.g. "PAID" or "SHIPPED"
+        else:
+             p_data.status = "AVAILABLE"
+             
+        results.append(p_data)
+        
+    return results
 
 @app.put("/products/{product_id}", response_model=ProductResponse)
 def update_product(product_id: str, updates: ProductUpdate, db: Session = Depends(get_db)):
@@ -1100,11 +1178,12 @@ def mark_order_received(
     db: Session = Depends(get_db), 
     current_user: models.User = Depends(get_current_user)
 ):
-    # Only the BUYER can mark it as received
     order = db.query(models.Order).filter(models.Order.id == order_id, models.Order.buyer_id == current_user.id).first()
     if not order: raise HTTPException(404, "Order not found")
     
-    order.status = "RECEIVED" 
+    order.status = "RECEIVED"
+    transfer_to_wardrobe(db, order)
+    
     db.commit()
     return {"status": "RECEIVED"}
 
@@ -1150,7 +1229,9 @@ def get_all_orders(db: Session = Depends(get_db), current_user: models.User = De
             "shipping_details": o.shipping_details, 
             "seller_id": o.seller_id,
             "seller_email": seller_email,
-            "seller_payout_info": seller_payout
+            "seller_payout_info": seller_payout,
+            "tracking_number": o.tracking_number,
+            "carrier": o.carrier
         })
         
     return result
@@ -1164,6 +1245,30 @@ def mark_order_paid_out(order_id: str, db: Session = Depends(get_db), current_us
     order = db.query(models.Order).filter(models.Order.id == order_id).first()
     if not order: raise HTTPException(404, "Order not found")
     
-    order.status = "COMPLETED" # Payout sent to seller
+    order.status = "COMPLETED"
+    
+    transfer_to_wardrobe(db, order)
+    
     db.commit()
     return {"status": "COMPLETED"}
+
+@app.put("/admin/orders/{order_id}/status")
+def admin_update_order_status(
+    order_id: str, 
+    data: OrderStatusUpdate,
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    if not current_user.is_admin:
+        raise HTTPException(403, "Not an Admin")
+    
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order: raise HTTPException(404, "Order not found")
+    
+    order.status = data.status
+
+    if data.status in ["RECEIVED", "COMPLETED"]:
+        transfer_to_wardrobe(db, order)
+
+    db.commit()
+    return {"status": order.status}
