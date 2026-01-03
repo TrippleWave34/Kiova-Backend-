@@ -1060,7 +1060,7 @@ def create_checkout_session(
             payment_method_types=['card'],
             line_items=[{
                 'price_data': {
-                    'currency': 'usd',
+                    'currency': 'gbp',
                     'product_data': {'name': product.name, 'images': product.image_urls[:1] if product.image_urls else []},
                     'unit_amount': int(product.price * 100), # Cents
                 },
