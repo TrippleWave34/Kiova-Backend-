@@ -131,7 +131,7 @@ class UserSchema(BaseModel):
     full_name: Optional[str] = None
     has_completed_onboarding: Optional[bool] = False
     payout_info: Optional[str] = None
-    is_admin: bool = False
+    is_admin: Optional[bool] = False
     class Config:
         from_attributes = True
 
