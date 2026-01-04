@@ -21,3 +21,4 @@ static
 # Misc
 clean_full.py
 make_admin.py
+recover_order.py
