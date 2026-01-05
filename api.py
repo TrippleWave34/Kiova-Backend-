@@ -225,6 +225,7 @@ class PayoutInfoUpdate(BaseModel):
 class ShipOrderRequest(BaseModel):
     tracking_number: str
     carrier: str
+    seller_note: Optional[str] = None
 
 class OrderStatusUpdate(BaseModel):
     status: str
@@ -1074,8 +1075,8 @@ def create_checkout_session(
                 'allowed_countries': ['US', 'CA', 'GB', 'DE', 'FR'], # Add your supported countries
             },
             
-            success_url= os.getenv("FRONTEND_URL") + '/success', 
-            cancel_url= os.getenv("FRONTEND_URL") + '/cancel',
+            success_url= os.getenv("FRONTEND_URL") + '/#/success', 
+            cancel_url= os.getenv("FRONTEND_URL") + '/#/cancel',
             
             # Store metadata so we know what this payment is for in the webhook
             metadata={
@@ -1147,7 +1148,8 @@ def get_seller_orders(db: Session = Depends(get_db), current_user: models.User =
             "product": p_name, 
             "amount": o.amount, 
             "status": o.status,
-            "shipping_details": o.shipping_details 
+            "shipping_details": o.shipping_details,
+            "seller_note": o.seller_note 
         })
     
     return result
@@ -1160,7 +1162,7 @@ def get_seller_orders(db: Session = Depends(get_db), current_user: models.User =
 @app.post("/orders/{order_id}/ship")
 def mark_order_shipped(
     order_id: str, 
-    data: ShipOrderRequest,
+    data: ShipOrderRequest, 
     db: Session = Depends(get_db), 
     current_user: models.User = Depends(get_current_user)
 ):
@@ -1170,6 +1172,7 @@ def mark_order_shipped(
     order.status = "SHIPPED"
     order.tracking_number = data.tracking_number
     order.carrier = data.carrier
+    order.seller_note = data.seller_note
     db.commit()
     return {"status": "SHIPPED"}
 
@@ -1197,7 +1200,8 @@ def get_buyer_orders(db: Session = Depends(get_db), current_user: models.User = 
         "amount": o.amount, 
         "status": o.status,
         "tracking_number": o.tracking_number,
-        "carrier": o.carrier
+        "carrier": o.carrier,
+        "seller_note": o.seller_note
     } for o in orders]
 
 # --- ADMIN: View All Orders ---
@@ -1273,3 +1277,58 @@ def admin_update_order_status(
 
     db.commit()
     return {"status": order.status}
+
+# --- BUYER/SELLER: Get Notifications ---
+@app.get("/notifications")
+def get_notifications(
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
+    notifications = []
+
+    # 1. Buyer Notifications: "Your item has shipped"
+    shipped_orders = db.query(models.Order).filter(
+        models.Order.buyer_id == current_user.id,
+        models.Order.status == "SHIPPED"
+    ).all()
+    
+    for o in shipped_orders:
+        p_name = o.product.name if o.product else "Item"
+        notifications.append({
+            "id": o.id,
+            "message": f"📦 Shipped: '{p_name}' is on the way!",
+            "seller_note": o.seller_note if o.seller_note else "Check 'My Purchases' for tracking.",
+            "type": "buyer"
+        })
+
+    # 2. Seller Notifications: "You made a sale!"
+    new_sales = db.query(models.Order).filter(
+        models.Order.seller_id == current_user.id,
+        models.Order.status == "PAID"
+    ).all()
+
+    for o in new_sales:
+        p_name = o.product.name if o.product else "Item"
+        notifications.append({
+            "id": o.id,
+            "message": f"💰 New Sale: Someone bought '{p_name}'!",
+            "seller_note": "Please go to 'My Sales' to view address and ship.",
+            "type": "seller"
+        })
+        
+    # 3. Seller Notifications: "Payout Complete"
+    completed_sales = db.query(models.Order).filter(
+        models.Order.seller_id == current_user.id,
+        models.Order.status == "COMPLETED"
+    ).limit(5).all()
+    
+    for o in completed_sales:
+        p_name = o.product.name if o.product else "Item"
+        notifications.append({
+            "id": o.id,
+            "message": f"✅ Payout Sent: '{p_name}' completed.",
+            "seller_note": "Funds have been sent to your payout method.",
+            "type": "seller"
+        })
+
+    return notifications

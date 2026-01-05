@@ -92,6 +92,7 @@ class Order(Base):
 
     tracking_number = Column(String, nullable=True)
     carrier = Column(String, nullable=True)
+    seller_note = Column(String, nullable=True)
 
     # Relationships
     product = relationship("Product")
