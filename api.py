@@ -311,7 +311,7 @@ def get_ai_metadata(image_url: str):
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are a fashion expert. Analyze the clothing image. Return a VALID JSON object with keys: category (Top/Bottom/Shoes/Outerwear), sub_category, gender (Men/Women/Unisex), color, pattern, style, and tags (list of 5 string keywords)."
+                    "content": "You are a fashion expert. Analyze the clothing image. Return a VALID JSON object with keys: category (one of: Top, Bottom, Shoes, Outerwear, Hat, Accessory for items like sunglasses/jewelry), sub_category, gender (Men/Women/Unisex), color, pattern, style, and tags (list of 5 string keywords)."
                 },
                 {
                     "role": "user", 
@@ -564,13 +564,15 @@ def style_me(
 
     target_categories = []
     if source_item.category == "Dress":
-        target_categories = ["Shoes", "Outerwear", "Accessory", "Bag"]
+        target_categories = ["Shoes", "Outerwear", "Accessory", "Bag", "Hat"]
     elif source_item.category == "Top": 
-        target_categories = ["Bottom", "Shoes", "Outerwear", "Accessory"]
+        target_categories = ["Bottom", "Shoes", "Outerwear", "Accessory", "Hat"]
     elif source_item.category in ["Bottom", "Pants", "Skirt"]: 
-        target_categories = ["Top", "Shoes", "Outerwear", "Accessory"]
+        target_categories = ["Top", "Shoes", "Outerwear", "Accessory", "Hat"]
     elif source_item.category == "Shoes": 
-        target_categories = ["Top", "Bottom", "Outerwear", "Dress"] 
+        target_categories = ["Top", "Bottom", "Outerwear", "Dress", "Hat"] 
+    elif source_item.category in ["Hat", "Accessory", "Bag"]:
+        target_categories = ["Top", "Bottom", "Shoes", "Outerwear", "Dress"]
     else:
         target_categories = ["Top", "Bottom", "Shoes", "Dress"]
 
@@ -615,28 +617,25 @@ def style_me(
             continue
         if cat in ["Top", "Bottom"] and "Dress" in categories_present:
             continue
+        if cat in ["Hat", "Accessory"] and ("Hat" in categories_present or "Accessory" in categories_present):
+             continue 
+
         if cat not in categories_present:
             categories_present.add(cat)
             final_matches.append(match)
 
-    # --- NEW: MANUAL CONVERSION TO AVOID VALIDATION ERROR ---
     response_matches = []
-    for match in final_matches[:5]: # Take the top 5
+    for match in final_matches[:5]:
         if isinstance(match, models.Product):
-            # It's a product, it fits perfectly
             response_matches.append(StyledItemResponse.model_validate(match))
         elif isinstance(match, models.WardrobeItem):
-            # It's a wardrobe item, we need to adapt it
             response_matches.append(
                 StyledItemResponse(
                     id=match.id,
-                    # No name or price for wardrobe items
                     name=f"My {match.style} {match.sub_category or match.category}",
                     price=None,
-                    # Unify image fields
                     image_url=match.image_url,
-                    image_urls=[match.image_url], # Frontend expects a list
-                    # Common fields
+                    image_urls=[match.image_url],
                     category=match.category,
                     sub_category=match.sub_category,
                     gender=match.gender,
@@ -649,7 +648,7 @@ def style_me(
 
     return {
         "user_item": source_item,
-        "styled_matches": response_matches, # Return the converted list
+        "styled_matches": response_matches,
         "style_tip": f"Matching {source_item.style} vibes for {source_item.gender}."
     }
 
