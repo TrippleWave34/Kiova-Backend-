@@ -160,6 +160,26 @@ class WardrobeItemResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class StyledItemResponse(BaseModel):
+    id: str
+    # Fields from Product
+    name: Optional[str] = None
+    price: Optional[float] = None
+    image_urls: Optional[List[str]] = None
+    # Fields from WardrobeItem
+    image_url: Optional[str] = None
+    # Common Fields
+    category: str
+    sub_category: Optional[str] = ""
+    gender: str
+    color: Optional[str] = ""
+    pattern: Optional[str] = ""
+    style: str
+    tags: List[str] = []
+    
+    class Config:
+        from_attributes = True
+
 class StyleMeRequest(BaseModel):
     wardrobe_item_id: Optional[str] = None
     product_id: Optional[str] = None
@@ -176,7 +196,7 @@ class StyleSourceResponse(BaseModel):
 
 class StyleMeResponse(BaseModel):
     user_item: StyleSourceResponse
-    styled_matches: List[ProductResponse]
+    styled_matches: List[StyledItemResponse]
     style_tip: str
 
 class CategoryBase(BaseModel):
@@ -528,19 +548,21 @@ def style_me(
     current_user: models.User = Depends(get_current_user)
 ):
     source_item = None
-    if data.wardrobe_item_id:
+    source_is_product = False
+
+    if data.product_id:
+        source_item = db.query(models.Product).filter(models.Product.id == data.product_id).first()
+        source_is_product = True
+    elif data.wardrobe_item_id:
         source_item = db.query(models.WardrobeItem).filter(
             models.WardrobeItem.id == data.wardrobe_item_id,
             models.WardrobeItem.user_id == current_user.id
         ).first()
-    elif data.product_id:
-        source_item = db.query(models.Product).filter(models.Product.id == data.product_id).first()
-        
+    
     if not source_item:
-        raise HTTPException(404, "Item not found")
+        raise HTTPException(404, "Source item not found")
 
     target_categories = []
-    
     if source_item.category == "Dress":
         target_categories = ["Shoes", "Outerwear", "Accessory", "Bag"]
     elif source_item.category == "Top": 
@@ -557,43 +579,77 @@ def style_me(
     elif source_item.gender == "Women": target_genders.append("Women")
     else: target_genders.extend(["Men", "Women"])
 
-    sold_product_ids = db.query(models.Order.product_id).filter(
-        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
-    ).subquery()
-
-    matches = db.query(models.Product).filter(
-        models.Product.category.in_(target_categories),
-        models.Product.gender.in_(target_genders),
-        models.Product.id != getattr(source_item, 'id', ''),
-        models.Product.id.notin_(sold_product_ids),     
-        models.Product.user_id != current_user.id        
-    ).order_by(
-        models.Product.embedding.cosine_distance(source_item.embedding)
-    ).limit(10).all()
+    matches_from_db = []
+    if source_is_product:
+        matches_from_db = db.query(models.WardrobeItem).filter(
+            models.WardrobeItem.user_id == current_user.id,
+            models.WardrobeItem.category.in_(target_categories),
+            models.WardrobeItem.gender.in_(target_genders)
+        ).order_by(
+            models.WardrobeItem.embedding.cosine_distance(source_item.embedding)
+        ).limit(10).all()
+    else:
+        sold_product_ids = db.query(models.Order.product_id).filter(
+            models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
+        ).subquery()
+        matches_from_db = db.query(models.Product).filter(
+            models.Product.category.in_(target_categories),
+            models.Product.gender.in_(target_genders),
+            models.Product.id.notin_(sold_product_ids),     
+            models.Product.user_id != current_user.id        
+        ).order_by(
+            models.Product.embedding.cosine_distance(source_item.embedding)
+        ).limit(10).all()
 
     final_matches = []
-    categories_present = set()
+    categories_present = {source_item.category}
     
     if source_item.category == "Dress":
-        categories_present.add("Top")
-        categories_present.add("Bottom")
-    elif source_item.category in ["Top", "Bottom"]:
-        categories_present.add("Dress") 
+        categories_present.update(["Top", "Bottom"])
+    elif source_item.category in ["Top", "Bottom", "Pants", "Skirt"]:
+        categories_present.add("Dress")
 
-    for match in matches:
+    for match in matches_from_db:
         cat = match.category
         if cat == "Dress" and ("Top" in categories_present or "Bottom" in categories_present):
-            continue 
+            continue
         if cat in ["Top", "Bottom"] and "Dress" in categories_present:
-            continue 
-
+            continue
         if cat not in categories_present:
             categories_present.add(cat)
             final_matches.append(match)
-            
+
+    # --- NEW: MANUAL CONVERSION TO AVOID VALIDATION ERROR ---
+    response_matches = []
+    for match in final_matches[:5]: # Take the top 5
+        if isinstance(match, models.Product):
+            # It's a product, it fits perfectly
+            response_matches.append(StyledItemResponse.model_validate(match))
+        elif isinstance(match, models.WardrobeItem):
+            # It's a wardrobe item, we need to adapt it
+            response_matches.append(
+                StyledItemResponse(
+                    id=match.id,
+                    # No name or price for wardrobe items
+                    name=f"My {match.style} {match.sub_category or match.category}",
+                    price=None,
+                    # Unify image fields
+                    image_url=match.image_url,
+                    image_urls=[match.image_url], # Frontend expects a list
+                    # Common fields
+                    category=match.category,
+                    sub_category=match.sub_category,
+                    gender=match.gender,
+                    color=match.color,
+                    pattern=match.pattern,
+                    style=match.style,
+                    tags=match.tags
+                )
+            )
+
     return {
         "user_item": source_item,
-        "styled_matches": final_matches[:5],
+        "styled_matches": response_matches, # Return the converted list
         "style_tip": f"Matching {source_item.style} vibes for {source_item.gender}."
     }
 
