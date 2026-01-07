@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Header, status
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile, Header, status, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles 
@@ -21,9 +21,6 @@ import base64
 import firebase_admin
 from firebase_admin import auth, credentials
 from contextlib import asynccontextmanager
-import torch
-import numpy as np
-from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation
 import stripe
 from fastapi import Request 
 
@@ -38,6 +35,7 @@ DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT", "o4-mini")
 DEPLOYMENT_EMBEDDING = os.getenv("AZURE_DEPLOYMENT_EMBEDDING", "text-embedding-3-small")
 FIREBASE_CREDS_B64 = os.getenv("FIREBASE_CREDENTIALS_BASE64")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+
 stripe.api_key = STRIPE_SECRET_KEY
 
 if not firebase_admin._apps:
@@ -59,12 +57,8 @@ ai_client = AzureOpenAI(
     api_version="2024-12-01-preview"
 )
 
-MODEL_NAME = "mattmdjaga/segformer_b2_clothes" 
-
-print(f"Loading {MODEL_NAME}...")
-processor = SegformerImageProcessor.from_pretrained(MODEL_NAME)
-model = AutoModelForSemanticSegmentation.from_pretrained(MODEL_NAME)
-print("Model Loaded.")
+# --- NO MORE SEGFORMER ---
+# We have removed the heavy transformer models to prevent 'eating' clothes.
 
 # models.Base.metadata.drop_all(bind=engine) 
 models.Base.metadata.create_all(bind=engine)
@@ -74,15 +68,10 @@ async def lifespan(app: FastAPI):
     # --- STARTUP LOGIC ---
     print("Executing startup database check...")
     
-    # We need to manually get a DB session here because Dependency Injection 
-    # doesn't work inside lifespan events the same way as endpoints
     db = next(get_db()) 
     
     try:
-        # Create tables (if not using Alembic)
         models.Base.metadata.create_all(bind=engine)
-
-        # Check and Seed Categories
         existing_categories = db.query(models.Category).all()
         existing_names = {cat.name for cat in existing_categories}
         
@@ -98,20 +87,17 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    # Yield control back to FastAPI to run the application
     yield 
-
-    # --- SHUTDOWN LOGIC (Optional) ---
     print("Shutting down application...")
 
 
 app = FastAPI(title="Kiova Real Backend v2", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, lock this down to your real domain
+    allow_origins=["*"], 
     allow_credentials=True,
-    allow_methods=["*"], # Allows all methods
-    allow_headers=["*"], # Allows all headers
+    allow_methods=["*"], 
+    allow_headers=["*"], 
 )
 
 INITIAL_CATEGORIES = [
@@ -124,7 +110,6 @@ security = HTTPBearer()
 security_optional = HTTPBearer(auto_error=False) 
 
 # --- PYDANTIC SCHEMAS ---
-
 class UserSchema(BaseModel):
     id: str
     email: str
@@ -172,7 +157,6 @@ class WardrobeItemResponse(BaseModel):
     gender: str
     style: str
     tags: List[str]
-    # user_id: str 
     class Config:
         from_attributes = True
 
@@ -209,16 +193,6 @@ class CategoryResponse(CategoryBase):
 class UserCategorySelection(BaseModel):
     category_ids: List[int]
 
-class WardrobeBatchCreate(BaseModel):
-    processed_image_url: str
-    category: str = "Unknown"
-    sub_category: str = ""
-    gender: str = "Unisex"
-    color: str = ""
-    pattern: str = ""
-    style: str = ""
-    tags: List[str] = []
-
 class PayoutInfoUpdate(BaseModel):
     info: str
 
@@ -233,22 +207,16 @@ class OrderStatusUpdate(BaseModel):
 # ==========================================
 # AUTHENTICATION DEPENDENCY
 # ==========================================
-
-# --- NEW: Logic to verify token and get current user ---
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
     token = credentials.credentials
     try:
-        # 1. Verify Token with Firebase
         decoded_token = auth.verify_id_token(token)
         uid = decoded_token['uid']
         email = decoded_token.get('email')
         
-        # 2. Check if user exists in Postgres
         user = db.query(models.User).filter(models.User.id == uid).first()
         
         if not user:
-            # Auto-create user if they passed Firebase check but aren't in Postgres yet
-            # (Alternatively, you can throw an error and force them to hit /auth/sync)
             user = models.User(id=uid, email=email)
             db.add(user)
             db.commit()
@@ -282,9 +250,15 @@ def get_current_user_optional(
 # ==========================================
 
 def process_and_upload(file_bytes, filename):
+    """
+    Standard REMBG processing. Simple, reliable, free.
+    """
     try:
         input_image = Image.open(io.BytesIO(file_bytes))
+        
+        # Free, local background removal
         output_image = remove(input_image)
+        
         output_buffer = io.BytesIO()
         output_image.save(output_buffer, format="PNG")
         output_buffer.seek(0)
@@ -337,185 +311,11 @@ def get_ai_metadata(image_url: str):
         print(f"Vision Error: {e}")
         raise HTTPException(status_code=500, detail="AI Analysis Failed")
 
-def segment_and_upload(file_bytes, filename):
-    try:
-        # 1. Load Original Image
-        input_image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        
-        # 2. Get High-Quality Cutout using REMBG (The Outline)
-        rembg_output = remove(input_image)
-        rembg_arr = np.array(rembg_output)
-        
-        # 3. Get Semantic Segmentation (The Body Parts)
-        inputs = processor(images=input_image, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model(**inputs)
-            
-        # Upscale mask to match image size
-        logits = outputs.logits.cpu()
-        upsampled_logits = torch.nn.functional.interpolate(
-            logits,
-            size=input_image.size[::-1],
-            mode="bilinear",
-            align_corners=False,
-        )
-        pred_seg = upsampled_logits.argmax(dim=1)[0] # Keep as Tensor for dilation
-
-        # 4. Define Body Labels to REMOVE
-        # 0:Background, 1:Hat, 2:Hair, 3:Sunglasses, 4:Upper-clothes, 5:Skirt, 
-        # 6:Pants, 7:Dress, 8:Belt, 9:Left-shoe, 10:Right-shoe, 11:Face, 
-        # 12:Left-leg, 13:Right-leg, 14:Left-arm, 15:Right-arm, 16:Bag, 17:Scarf
-        
-        # We remove: Hair(2), Sunglasses(3), Face(11), Legs(12,13), Arms(14,15)
-        body_labels = [2, 3, 11, 12, 13, 14, 15] 
-
-        # Create binary mask (1 where body is, 0 elsewhere)
-        # Using torch operations for speed
-        body_mask = torch.zeros_like(pred_seg, dtype=torch.float32)
-        for label in body_labels:
-            body_mask = torch.where(pred_seg == label, 1.0, body_mask)
-
-        # 5. DILATION (The Secret Sauce)
-        # Expands the body mask by 5-10 pixels to eat up skin edges and halos
-        # We use MaxPool2d as a hacky, fast dilation without needing OpenCV
-        if body_mask.sum() > 0:
-            body_mask = body_mask.unsqueeze(0).unsqueeze(0) # Add batch/channel dims
-            # Kernel size 13 = Dilate by ~6 pixels. Increase if you still see skin edges.
-            dilated_mask = torch.nn.functional.max_pool2d(body_mask, kernel_size=13, stride=1, padding=6)
-            body_mask_np = dilated_mask.squeeze().numpy()
-        else:
-            body_mask_np = body_mask.numpy()
-
-        # 6. Apply to REMBG Output
-        alpha_channel = rembg_arr[:, :, 3]
-        
-        # If the pixel is body (1), make it transparent (0). Otherwise keep rembg alpha.
-        new_alpha = np.where(body_mask_np > 0.5, 0, alpha_channel).astype(np.uint8)
-        
-        rembg_arr[:, :, 3] = new_alpha
-        final_image = Image.fromarray(rembg_arr)
-
-        # 7. Crop to Content
-        bbox = final_image.getbbox()
-        if bbox:
-            final_image = final_image.crop(bbox)
-
-        # 8. Upload
-        output_buffer = io.BytesIO()
-        final_image.save(output_buffer, format="PNG")
-        output_buffer.seek(0)
-        
-        unique_name = f"{uuid.uuid4()}.png"
-        blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=unique_name)
-        blob_client.upload_blob(
-            output_buffer, 
-            content_settings=ContentSettings(content_type='image/png') 
-        )
-        return blob_client.url
-
-    except Exception as e:
-        print(f"Segmentation Error: {e}")
-        # Fallback to simple rembg if AI fails
-        return process_and_upload(file_bytes, filename)
-    
-
-def segment_and_split(file_bytes):
-    """
-    Returns a list of dicts: [{'image_url': '...', 'category': 'Top', 'label_id': 4}, ...]
-    """
-    try:
-        input_image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        
-        # 1. REMBG for the whole person outline
-        rembg_output = remove(input_image)
-        rembg_arr = np.array(rembg_output)
-        
-        # 2. Segformer for parts
-        inputs = processor(images=input_image, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model(**inputs)
-            
-        logits = outputs.logits.cpu()
-        upsampled_logits = torch.nn.functional.interpolate(
-            logits, size=input_image.size[::-1], mode="bilinear", align_corners=False
-        )
-        pred_seg = upsampled_logits.argmax(dim=1)[0].numpy()
-
-        # 3. Define Categories to Extract
-        # Map Segformer IDs to readable names
-        # 4:Upper-clothes, 5:Skirt, 6:Pants, 7:Dress, 9:Left-shoe, 10:Right-shoe, 16:Bag, 17:Scarf
-        clothing_map = {
-            4: "Top", 5: "Bottom", 6: "Bottom", 7: "Dress", 
-            9: "Shoes", 10: "Shoes", 16: "Bag", 17: "Accessory"
-        }
-        
-        detected_items = []
-        found_labels = np.unique(pred_seg)
-
-        for label_id in found_labels:
-            if label_id not in clothing_map:
-                continue
-                
-            category_name = clothing_map[label_id]
-            
-            # --- Special Logic for Shoes ---
-            # Merge Left(9) and Right(10) into one "Shoes" item if both exist
-            if label_id == 10 and 9 in found_labels:
-                continue # Skip right shoe, we handle it with left shoe
-            
-            mask_ids = [label_id]
-            if label_id == 9: mask_ids.append(10) # Grab both shoes
-            
-            # Create Mask for this specific item
-            item_mask = np.isin(pred_seg, mask_ids).astype(np.uint8) * 255
-            
-            # Apply to REMBG alpha
-            alpha_channel = rembg_arr[:, :, 3]
-            new_alpha = np.where(item_mask > 0, alpha_channel, 0).astype(np.uint8)
-            
-            item_arr = rembg_arr.copy()
-            item_arr[:, :, 3] = new_alpha
-            final_item_img = Image.fromarray(item_arr)
-            
-            # Crop to content
-            bbox = final_item_img.getbbox()
-            if bbox:
-                final_item_img = final_item_img.crop(bbox)
-                
-                # Upload
-                output_buffer = io.BytesIO()
-                final_item_img.save(output_buffer, format="PNG")
-                output_buffer.seek(0)
-                
-                unique_name = f"{uuid.uuid4()}.png"
-                blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=unique_name)
-                blob_client.upload_blob(output_buffer, content_settings=ContentSettings(content_type='image/png'))
-                
-                detected_items.append({
-                    "image_url": blob_client.url,
-                    "category": category_name, # Rough category from Segformer
-                    "confidence": 0.95 # Mock confidence
-                })
-                
-        return detected_items
-
-    except Exception as e:
-        print(f"Split Error: {e}")
-        return []
-    
-
 def transfer_to_wardrobe(db: Session, order: models.Order):
-    """
-    Clones the sold Product into the Buyer's Wardrobe.
-    """
     product = order.product
     if not product: 
         return
-    
-    # 1. Get primary image
     main_image = product.image_urls[0] if product.image_urls else ""
-
-    # 2. Check if already added (Prevent duplicates if Admin clicks Pay after Buyer clicks Receive)
     exists = db.query(models.WardrobeItem).filter(
         models.WardrobeItem.user_id == order.buyer_id,
         models.WardrobeItem.image_url == main_image
@@ -524,7 +324,6 @@ def transfer_to_wardrobe(db: Session, order: models.Order):
     if exists:
         return
 
-    # 3. Create Wardrobe Item
     new_item = models.WardrobeItem(
         id=str(uuid.uuid4()),
         user_id=order.buyer_id,
@@ -539,7 +338,6 @@ def transfer_to_wardrobe(db: Session, order: models.Order):
         embedding=product.embedding 
     )
     db.add(new_item)
-    # Note: We don't commit here, we let the parent endpoint commit.
 
 # ==========================================
 # ENDPOINTS
@@ -547,10 +345,6 @@ def transfer_to_wardrobe(db: Session, order: models.Order):
 
 @app.post("/users/sync", response_model=UserSchema)
 def sync_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
-    """
-    Flutter calls this immediately after Firebase Login.
-    It ensures the user exists in Postgres.
-    """
     token = credentials.credentials
     decoded_token = auth.verify_id_token(token)
     uid = decoded_token['uid']
@@ -569,9 +363,6 @@ def complete_onboarding(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """
-    Sets the onboarding flag to True. Called when user finishes the intro flow.
-    """
     current_user.has_completed_onboarding = True
     db.commit()
     db.refresh(current_user)
@@ -588,34 +379,31 @@ def update_payout_info(
     return {"status": "updated"}
 
 @app.post("/analyze-image")
-async def analyze_image(file: UploadFile = File(...)):
-    image_url = segment_and_upload(file.file.read(), file.filename)
+async def analyze_image(
+    file: UploadFile = File(...),
+    skip_ai: bool = Form(False) # <--- New Parameter
+):
+    """
+    Standard Single Item Upload.
+    If skip_ai is True, it ONLY removes background and hosts the image (faster/cheaper).
+    """
+    image_url = process_and_upload(file.file.read(), file.filename)
+    
+    if skip_ai:
+        # Just return the URL, empty metadata
+        return {
+            "status": "success", 
+            "ai_results": {
+                "processed_image_url": image_url,
+                "category": "Unknown", # Defaults
+                "tags": []
+            }
+        }
+
+    # Full Analysis for the main image
     ai_data = get_ai_metadata(image_url)
     ai_data["processed_image_url"] = image_url
     return {"status": "success", "ai_results": ai_data}
-
-@app.post("/analyze-image-multi")
-async def analyze_image_multi(file: UploadFile = File(...)):
-    # 1. Split image into parts
-    file_bytes = file.file.read()
-    split_items = segment_and_split(file_bytes)
-    
-    if not split_items:
-        # Fallback: If nothing detected, return original as one item
-        # Reset file pointer or re-read? Better to pass bytes.
-        # For simplicity, we just return error or fallback logic here.
-        # Let's assume we reuse the single-item logic as fallback.
-        url = segment_and_upload(file_bytes, file.filename)
-        return {"status": "fallback", "items": [{"image_url": url, "category": "Unknown"}]}
-
-    # 2. Run AI Analysis on EACH part (to get detailed tags/colors)
-    final_results = []
-    for item in split_items:
-        meta = get_ai_metadata(item['image_url']) # GPT-4o analyzes the cropped part
-        meta['processed_image_url'] = item['image_url']
-        final_results.append(meta)
-
-    return {"status": "success", "items": final_results}
 
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, 
@@ -688,7 +476,6 @@ def get_featured_products(
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
 
-    # Personalization Logic
     user_styles = [cat.name for cat in current_user.selected_categories] if current_user else []
 
     if not user_styles:
@@ -700,9 +487,9 @@ def get_featured_products(
 async def add_to_wardrobe(
     file: UploadFile = File(...), 
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user) # <--- LOCKED
+    current_user: models.User = Depends(get_current_user) 
 ):
-    image_url = segment_and_upload(file.file.read(), file.filename)
+    image_url = process_and_upload(file.file.read(), file.filename)
     meta = get_ai_metadata(image_url)
     
     description = f"{meta.get('gender')} {meta.get('style')} {meta.get('color')} {meta.get('sub_category')} {' '.join(meta.get('tags', []))}"
@@ -726,33 +513,6 @@ async def add_to_wardrobe(
     db.commit()
     db.refresh(new_item)
     return new_item
-
-@app.post("/wardrobe/batch")
-def add_wardrobe_batch(
-    item: WardrobeBatchCreate, 
-    db: Session = Depends(get_db), 
-    current_user: models.User = Depends(get_current_user)
-):
-    # Vectorize
-    description = f"{item.gender} {item.style} {item.color} {item.sub_category} {' '.join(item.tags)}"
-    vector = get_vector(description)
-
-    new_item = models.WardrobeItem(
-        id=str(uuid.uuid4()),
-        user_id=current_user.id,
-        image_url=item.processed_image_url, # Already hosted
-        category=item.category,
-        sub_category=item.sub_category,
-        gender=item.gender,
-        color=item.color,
-        pattern=item.pattern,
-        style=item.style,
-        tags=item.tags,
-        embedding=vector
-    )
-    db.add(new_item)
-    db.commit()
-    return {"status": "saved"}
 
 @app.get("/wardrobe", response_model=List[WardrobeItemResponse])
 def get_wardrobe(
@@ -779,30 +539,23 @@ def style_me(
     if not source_item:
         raise HTTPException(404, "Item not found")
 
-    # 1. Determine Logic based on Category
     target_categories = []
     
     if source_item.category == "Dress":
-        # If source is dress, we only want shoes, accessories, outerwear
         target_categories = ["Shoes", "Outerwear", "Accessory", "Bag"]
     elif source_item.category == "Top": 
         target_categories = ["Bottom", "Shoes", "Outerwear", "Accessory"]
     elif source_item.category in ["Bottom", "Pants", "Skirt"]: 
         target_categories = ["Top", "Shoes", "Outerwear", "Accessory"]
     elif source_item.category == "Shoes": 
-        # Decide between Dress OR Top+Bottom? For now, stick to Top+Bottom defaults
         target_categories = ["Top", "Bottom", "Outerwear", "Dress"] 
     else:
-        # Fallback
         target_categories = ["Top", "Bottom", "Shoes", "Dress"]
 
-    # 2. Gender Logic
     target_genders = ["Unisex"]
     if source_item.gender == "Men": target_genders.append("Men")
     elif source_item.gender == "Women": target_genders.append("Women")
     else: target_genders.extend(["Men", "Women"])
-
-    # 3. Fetch Matches
 
     sold_product_ids = db.query(models.Order.product_id).filter(
         models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
@@ -818,32 +571,26 @@ def style_me(
         models.Product.embedding.cosine_distance(source_item.embedding)
     ).limit(10).all()
 
-    # 4. Filter for Logic Conflicts (e.g. No Dress + Pants)
     final_matches = []
     categories_present = set()
     
-    # If source is dress, mark top/bottom as 'taken' so we don't add them
     if source_item.category == "Dress":
         categories_present.add("Top")
         categories_present.add("Bottom")
     elif source_item.category in ["Top", "Bottom"]:
-        categories_present.add("Dress") # Don't add a dress if we have a shirt/pants source
+        categories_present.add("Dress") 
 
     for match in matches:
         cat = match.category
-        
-        # Conflict Resolution
         if cat == "Dress" and ("Top" in categories_present or "Bottom" in categories_present):
-            continue # Skip dress if we have separates
+            continue 
         if cat in ["Top", "Bottom"] and "Dress" in categories_present:
-            continue # Skip separates if we have a dress
+            continue 
 
-        # Ensure variety (one per category)
         if cat not in categories_present:
             categories_present.add(cat)
             final_matches.append(match)
             
-    # Limit to 5 for UI
     return {
         "user_item": source_item,
         "styled_matches": final_matches[:5],
@@ -861,11 +608,11 @@ def get_products(
     query = db.query(models.Product)
 
     sold_orders = db.query(models.Order.product_id).filter(
-        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]), # Added RECEIVED
+        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]), 
         models.Order.product_id.isnot(None)
     ).all()
     
-    sold_ids = [row[0] for row in sold_orders] # Convert to Python list
+    sold_ids = [row[0] for row in sold_orders] 
     
     if sold_ids:
         query = query.filter(models.Product.id.notin_(sold_ids))
@@ -886,25 +633,15 @@ def get_my_products(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    # 1. Get all my products
     products = db.query(models.Product).filter(models.Product.user_id == current_user.id).all()
-    
-    # 2. Get all orders where I am the seller
     sales = db.query(models.Order).filter(models.Order.seller_id == current_user.id).all()
-    
-    # 3. Create a map: {product_id: 'PAID'}
     product_status_map = {order.product_id: order.status for order in sales}
 
-    # 4. Attach status to response manually
     results = []
     for p in products:
-        # We convert the ORM object to the Pydantic model to inject the status
-        # (Since the ORM object might not have a 'status' column in the products table)
         p_data = ProductResponse.model_validate(p)
-        
-        # Check if this product ID exists in our sales map
         if p.id in product_status_map:
-             p_data.status = product_status_map[p.id] # e.g. "PAID" or "SHIPPED"
+             p_data.status = product_status_map[p.id] 
         else:
              p_data.status = "AVAILABLE"
              
@@ -951,7 +688,6 @@ def delete_wardrobe_item(
     
     if not item: raise HTTPException(404, detail="Wardrobe item not found")
     
-    # Delete from Azure Blob Storage here to save space
     blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=item.image_url.split('/')[-1])
     blob_client.delete_blob()
 
@@ -966,9 +702,6 @@ def delete_wardrobe_item(
 
 @app.get("/categories", response_model=List[CategoryResponse])
 def get_all_categories(db: Session = Depends(get_db)):
-    """
-    Public endpoint to fetch all style categories for the selection screen.
-    """
     return db.query(models.Category).order_by(models.Category.name).all()
 
 @app.post("/users/me/categories", status_code=status.HTTP_204_NO_CONTENT)
@@ -977,13 +710,7 @@ def select_user_categories(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """
-    Saves the list of categories a user has selected. Replaces any old selection.
-    """
-    # Clear previous selections
     current_user.selected_categories.clear()
-
-    # Find the category objects from the provided IDs
     categories_to_add = db.query(models.Category).filter(models.Category.id.in_(selection.category_ids)).all()
     
     if len(categories_to_add) != len(selection.category_ids):
@@ -998,16 +725,12 @@ def get_user_selected_categories(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """
-    Returns the categories the current logged-in user has selected.
-    """
     return current_user.selected_categories
 
 @app.post("/admin/categories", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED)
 def create_category(
     category: CategoryCreate, 
     db: Session = Depends(get_db)
-    # TODO: Add an admin verification dependency here
 ):
     db_category = models.Category(name=category.name)
     db.add(db_category)
@@ -1020,7 +743,6 @@ def update_category(
     category_id: int, 
     category_update: CategoryCreate, 
     db: Session = Depends(get_db)
-    # TODO: Add admin check
 ):
     db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
     if not db_category:
@@ -1035,7 +757,6 @@ def update_category(
 def delete_category(
     category_id: int, 
     db: Session = Depends(get_db)
-    # TODO: Add admin check
 ):
     db_category = db.query(models.Category).filter(models.Category.id == category_id).first()
     if not db_category:
@@ -1057,28 +778,22 @@ def create_checkout_session(
     if not product: raise HTTPException(404, "Product not found")
 
     try:
-        # Create Stripe Session
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{
                 'price_data': {
                     'currency': 'gbp',
                     'product_data': {'name': product.name, 'images': product.image_urls[:1] if product.image_urls else []},
-                    'unit_amount': int(product.price * 100), # Cents
+                    'unit_amount': int(product.price * 100), 
                 },
                 'quantity': 1,
             }],
             mode='payment',
-            
-            # CRITICAL: Ask Stripe to collect the address for us
             shipping_address_collection={
-                'allowed_countries': ['US', 'CA', 'GB', 'DE', 'FR'], # Add your supported countries
+                'allowed_countries': ['US', 'CA', 'GB', 'DE', 'FR'], 
             },
-            
             success_url= os.getenv("FRONTEND_URL") + '/#/success', 
             cancel_url= os.getenv("FRONTEND_URL") + '/#/cancel',
-            
-            # Store metadata so we know what this payment is for in the webhook
             metadata={
                 'product_id': product.id,
                 'buyer_id': current_user.id,
@@ -1112,7 +827,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         if not shipping:
             shipping = session.get('customer_details')
 
-        print(f"📦 Saving Address: {shipping}") # Debug Log
+        print(f"📦 Saving Address: {shipping}") 
 
         new_order = models.Order(
             id=session['id'],
@@ -1153,11 +868,6 @@ def get_seller_orders(db: Session = Depends(get_db), current_user: models.User =
         })
     
     return result
-
-@app.get("/orders/selling")
-def get_seller_orders(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    orders = db.query(models.Order).filter(models.Order.seller_id == current_user.id).all()
-    return orders
 
 @app.post("/orders/{order_id}/ship")
 def mark_order_shipped(
@@ -1251,7 +961,6 @@ def mark_order_paid_out(order_id: str, db: Session = Depends(get_db), current_us
     if not order: raise HTTPException(404, "Order not found")
     
     order.status = "COMPLETED"
-    
     transfer_to_wardrobe(db, order)
     
     db.commit()
@@ -1286,7 +995,7 @@ def get_notifications(
 ):
     notifications = []
 
-    # 1. Buyer Notifications: "Your item has shipped"
+    # 1. Buyer Notifications
     shipped_orders = db.query(models.Order).filter(
         models.Order.buyer_id == current_user.id,
         models.Order.status == "SHIPPED"
@@ -1301,7 +1010,7 @@ def get_notifications(
             "type": "buyer"
         })
 
-    # 2. Seller Notifications: "You made a sale!"
+    # 2. Seller Notifications
     new_sales = db.query(models.Order).filter(
         models.Order.seller_id == current_user.id,
         models.Order.status == "PAID"
@@ -1316,7 +1025,7 @@ def get_notifications(
             "type": "seller"
         })
         
-    # 3. Seller Notifications: "Payout Complete"
+    # 3. Seller Notifications: Payout
     completed_sales = db.query(models.Order).filter(
         models.Order.seller_id == current_user.id,
         models.Order.status == "COMPLETED"
