@@ -55,6 +55,7 @@ class Product(Base):
     style = Column(String, nullable=True)  
     gender = Column(String, nullable=True)       
     tags = Column(JSON)
+    affiliate_url = Column(String, nullable=True)
     embedding = Column(Vector(1536))
 
 class WardrobeItem(Base):

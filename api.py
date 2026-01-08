@@ -131,6 +131,7 @@ class ProductCreate(BaseModel):
     pattern: str
     style: str
     tags: List[str]
+    affiliate_url: Optional[str] = None
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -143,6 +144,7 @@ class ProductUpdate(BaseModel):
     pattern: Optional[str] = None
     style: Optional[str] = None
     tags: Optional[List[str]] = None
+    affiliate_url: Optional[str] = None
 
 class ProductResponse(ProductCreate):
     id: str
@@ -428,9 +430,16 @@ async def analyze_image(
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, 
                    db: Session = Depends(get_db),
-                   current_user: models.User = Depends(get_current_user_optional)):
-    if not current_user.payout_info:
-        raise HTTPException(status_code=400, detail="You must set up Payout Details in Settings before listing an item.")
+                   current_user: models.User = Depends(get_current_user)): # Use required user now
+    
+    affiliate_link = None
+    if current_user.is_admin and product.affiliate_url:
+        affiliate_link = product.affiliate_url
+    elif not current_user.is_admin and product.price == 0:
+        raise HTTPException(status_code=400, detail="Price must be greater than zero.")
+
+    if not current_user.payout_info and not affiliate_link:
+        raise HTTPException(status_code=400, detail="You must set up Payout Details before listing an item.")
     
     new_id = str(uuid.uuid4())
     description = f"{product.gender} {product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
@@ -449,13 +458,15 @@ def create_product(product: ProductCreate,
         pattern=product.pattern,
         style=product.style,
         tags=product.tags,
-        embedding=vector
+        embedding=vector,
+        affiliate_url=affiliate_link
     )
     
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
     return db_item
+
 
 @app.get("/products/top-picks", response_model=List[ProductResponse])
 def get_top_picks(
@@ -477,31 +488,46 @@ def get_top_picks(
         
     return query.order_by(func.random()).limit(5).all()
 
-@app.get("/products/featured", response_model=List[ProductResponse])
 def get_featured_products(
     db: Session = Depends(get_db), 
-    current_user: models.User = Depends(get_current_user_optional)
+    current_user: Optional[models.User] = Depends(get_current_user_optional)
 ):
+    base_query = db.query(models.Product)
+    sold_ids = [row[0] for row in db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"])).all()]
+    if sold_ids:
+        base_query = base_query.filter(models.Product.id.notin_(sold_ids))
+    if current_user:
+        base_query = base_query.filter(models.Product.user_id != current_user.id)
+
+    user_styles = []
+    if current_user and current_user.selected_categories:
+        user_styles = [cat.name for cat in current_user.selected_categories]
+
+    if user_styles:
+        return base_query.filter(models.Product.style.in_(user_styles)).order_by(func.random()).limit(10).all()
+    else:
+        return []
     
-    sold_orders = db.query(models.Order.product_id).filter(
-        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]),
-        models.Order.product_id.isnot(None)
-    ).all()
-    sold_ids = [row[0] for row in sold_orders]
+@app.get("/products/discover", response_model=List[ProductResponse])
+def get_discover_products(
+    page: int = 1,
+    page_size: int = 10,
+    db: Session = Depends(get_db),
+    current_user: Optional[models.User] = Depends(get_current_user_optional)
+):
+    # This endpoint provides all other items with pagination.
     
+    # 1. Base query (same as above)
     query = db.query(models.Product)
+    sold_ids = [row[0] for row in db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"])).all()]
     if sold_ids:
         query = query.filter(models.Product.id.notin_(sold_ids))
-        
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
 
-    user_styles = [cat.name for cat in current_user.selected_categories] if current_user else []
-
-    if not user_styles:
-        return query.order_by(func.random()).limit(20).all()
-
-    return query.filter(models.Product.style.in_(user_styles)).limit(20).all()
+    # 2. Apply pagination
+    offset = (page - 1) * page_size
+    return query.order_by(func.random()).offset(offset).limit(page_size).all()
 
 @app.post("/wardrobe", response_model=WardrobeItemResponse)
 async def add_to_wardrobe(
@@ -705,11 +731,25 @@ def get_my_products(
     return results
 
 @app.put("/products/{product_id}", response_model=ProductResponse)
-def update_product(product_id: str, updates: ProductUpdate, db: Session = Depends(get_db)):
+def update_product(
+    product_id: str, 
+    updates: ProductUpdate, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user) # Require user for security
+):
     item = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not item: raise HTTPException(404, detail="Product not found")
 
+    if item.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to edit this product")
+
     update_data = updates.model_dump(exclude_unset=True)
+    
+    if 'affiliate_url' in update_data:
+        if current_user.is_admin:
+            setattr(item, 'affiliate_url', update_data['affiliate_url'])
+        del update_data['affiliate_url'] 
+
     for key, value in update_data.items():
         setattr(item, key, value)
 
@@ -721,6 +761,7 @@ def update_product(product_id: str, updates: ProductUpdate, db: Session = Depend
     db.commit()
     db.refresh(item)
     return item
+
 
 @app.delete("/products/{product_id}")
 def delete_product(product_id: str, db: Session = Depends(get_db)):
