@@ -23,6 +23,7 @@ from firebase_admin import auth, credentials
 from contextlib import asynccontextmanager
 import stripe
 from fastapi import Request 
+import requests
 
 load_dotenv()
 
@@ -35,6 +36,16 @@ DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT", "o4-mini")
 DEPLOYMENT_EMBEDDING = os.getenv("AZURE_DEPLOYMENT_EMBEDDING", "text-embedding-3-small")
 FIREBASE_CREDS_B64 = os.getenv("FIREBASE_CREDENTIALS_BASE64")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+
+ALLOWED_CATEGORIES = [
+    "Top", "Bottom", "Shoes", "Outerwear", "Dress", "Hat", "Accessory", "Bag"
+]
+
+ALLOWED_STYLES = [
+    "Casual", "Streetwear", "Smart Casual", "Business/Formal", "Athletic",
+    "Minimalist", "Trendy", "Vintage", "Y2K", "Techwear", "Peppy",
+    "Elegant", "Boho", "Luxury", "Poppy"
+]
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -57,25 +68,19 @@ ai_client = AzureOpenAI(
     api_version="2024-12-01-preview"
 )
 
-# --- NO MORE SEGFORMER ---
-# We have removed the heavy transformer models to prevent 'eating' clothes.
-
-# models.Base.metadata.drop_all(bind=engine) 
 models.Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- STARTUP LOGIC ---
     print("Executing startup database check...")
-    
     db = next(get_db()) 
-    
     try:
         models.Base.metadata.create_all(bind=engine)
         existing_categories = db.query(models.Category).all()
         existing_names = {cat.name for cat in existing_categories}
         
-        for category_name in INITIAL_CATEGORIES:
+        for category_name in ALLOWED_STYLES:
             if category_name not in existing_names:
                 new_cat = models.Category(name=category_name)
                 db.add(new_cat)
@@ -86,7 +91,6 @@ async def lifespan(app: FastAPI):
         print(f"Error during startup: {e}")
     finally:
         db.close()
-
     yield 
     print("Shutting down application...")
 
@@ -99,12 +103,6 @@ app.add_middleware(
     allow_methods=["*"], 
     allow_headers=["*"], 
 )
-
-INITIAL_CATEGORIES = [
-    "Casual", "Streetwear", "Smart Casual", "Business/Formal", "Athletic",
-    "Minimalist", "Trendy", "Vintage", "Y2K", "Techwear", "Peppy",
-    "Elegant", "Boho", "Luxury", "Poppy"
-]
 
 security = HTTPBearer()
 security_optional = HTTPBearer(auto_error=False) 
@@ -164,13 +162,10 @@ class WardrobeItemResponse(BaseModel):
 
 class StyledItemResponse(BaseModel):
     id: str
-    # Fields from Product
     name: Optional[str] = None
     price: Optional[float] = None
     image_urls: Optional[List[str]] = None
-    # Fields from WardrobeItem
     image_url: Optional[str] = None
-    # Common Fields
     category: str
     sub_category: Optional[str] = ""
     gender: str
@@ -178,7 +173,6 @@ class StyledItemResponse(BaseModel):
     pattern: Optional[str] = ""
     style: str
     tags: List[str] = []
-    
     class Config:
         from_attributes = True
 
@@ -272,15 +266,9 @@ def get_current_user_optional(
 # ==========================================
 
 def process_and_upload(file_bytes, filename):
-    """
-    Standard REMBG processing. Simple, reliable, free.
-    """
     try:
         input_image = Image.open(io.BytesIO(file_bytes))
-        
-        # Free, local background removal
         output_image = remove(input_image)
-        
         output_buffer = io.BytesIO()
         output_image.save(output_buffer, format="PNG")
         output_buffer.seek(0)
@@ -308,12 +296,22 @@ def get_vector(text_input: str):
 
 def get_ai_metadata(image_url: str):
     try:
+        categories_str = ", ".join(ALLOWED_CATEGORIES)
+        styles_str = ", ".join(ALLOWED_STYLES)
+        
         response = ai_client.chat.completions.create(
             model=DEPLOYMENT_CHAT,
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are a fashion expert. Analyze the clothing image. Return a VALID JSON object with keys: category (one of: Top, Bottom, Shoes, Outerwear, Hat, Accessory for items like sunglasses/jewelry), sub_category, gender (Men/Women/Unisex), color, pattern, style, and tags (list of 5 string keywords)."
+                    "content": f"""You are a fashion expert. Analyze the clothing image. Return a VALID JSON object.
+                    
+                    STRICTLY ADHERE TO THESE LISTS:
+                    - 'category' MUST be one of: {categories_str}
+                    - 'style' MUST be one of: {styles_str} (Pick the closest match. Do NOT invent new styles like 'Bodycon' or 'Bohemian'. Use 'Boho' for Bohemian items.)
+                    - 'gender': Men, Women, or Unisex.
+                    
+                    Return keys: category, sub_category, gender, color, pattern, style, and tags (list of 5 keywords)."""
                 },
                 {
                     "role": "user", 
@@ -326,8 +324,22 @@ def get_ai_metadata(image_url: str):
             response_format={"type": "json_object"}
         )
         data = json.loads(response.choices[0].message.content)
+        
         if "color" in data and isinstance(data["color"], list):
             data["color"] = " and ".join(data["color"])
+            
+        if data.get("style") not in ALLOWED_STYLES:
+            print(f"⚠️ AI Hallucinated Style: '{data.get('style')}'. Fallback to Casual.")
+            style_raw = data.get("style", "").lower()
+            if "bohemian" in style_raw: data["style"] = "Boho"
+            elif "bodycon" in style_raw: data["style"] = "Trendy"
+            elif "work" in style_raw: data["style"] = "Business/Formal"
+            else: data["style"] = "Casual"
+
+        if data.get("category") not in ALLOWED_CATEGORIES:
+             print(f"⚠️ AI Hallucinated Category: '{data.get('category')}'. Fallback to Top.")
+             data["category"] = "Top"
+
         return data
     except Exception as e:
         print(f"Vision Error: {e}")
@@ -403,26 +415,24 @@ def update_payout_info(
 @app.post("/analyze-image")
 async def analyze_image(
     file: UploadFile = File(...),
-    skip_ai: bool = Form(False) # <--- New Parameter
+    skip_ai: bool = Form(False) 
 ):
     """
     Standard Single Item Upload.
-    If skip_ai is True, it ONLY removes background and hosts the image (faster/cheaper).
+    If skip_ai is True, it ONLY removes background and hosts the image.
     """
     image_url = process_and_upload(file.file.read(), file.filename)
     
     if skip_ai:
-        # Just return the URL, empty metadata
         return {
             "status": "success", 
             "ai_results": {
                 "processed_image_url": image_url,
-                "category": "Unknown", # Defaults
+                "category": "Unknown", 
                 "tags": []
             }
         }
 
-    # Full Analysis for the main image
     ai_data = get_ai_metadata(image_url)
     ai_data["processed_image_url"] = image_url
     return {"status": "success", "ai_results": ai_data}
@@ -430,7 +440,7 @@ async def analyze_image(
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, 
                    db: Session = Depends(get_db),
-                   current_user: models.User = Depends(get_current_user)): # Use required user now
+                   current_user: models.User = Depends(get_current_user)):
     
     affiliate_link = None
     if current_user.is_admin and product.affiliate_url:
@@ -442,6 +452,7 @@ def create_product(product: ProductCreate,
         raise HTTPException(status_code=400, detail="You must set up Payout Details before listing an item.")
     
     new_id = str(uuid.uuid4())
+    clean_style = product.style.title() if product.style else "Casual"
     description = f"{product.gender} {product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
     vector = get_vector(description)
     
@@ -467,7 +478,6 @@ def create_product(product: ProductCreate,
     db.refresh(db_item)
     return db_item
 
-
 @app.get("/products/top-picks", response_model=List[ProductResponse])
 def get_top_picks(
     db: Session = Depends(get_db),
@@ -488,26 +498,52 @@ def get_top_picks(
         
     return query.order_by(func.random()).limit(5).all()
 
+@app.get("/products/featured", response_model=List[ProductResponse])
 def get_featured_products(
     db: Session = Depends(get_db), 
     current_user: Optional[models.User] = Depends(get_current_user_optional)
 ):
+    # 1. Base Query
     base_query = db.query(models.Product)
-    sold_ids = [row[0] for row in db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"])).all()]
+    
+    # Filter out sold items (Robust check against NULLs)
+    sold_orders = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]),
+        models.Order.product_id.isnot(None) 
+    ).all()
+    
+    sold_ids = [row[0] for row in sold_orders if row[0] is not None]
+
     if sold_ids:
         base_query = base_query.filter(models.Product.id.notin_(sold_ids))
+    
+    # Hide own items
     if current_user:
         base_query = base_query.filter(models.Product.user_id != current_user.id)
 
+    # 2. Get User Preferences
     user_styles = []
-    if current_user and current_user.selected_categories:
-        user_styles = [cat.name for cat in current_user.selected_categories]
-
-    if user_styles:
-        return base_query.filter(models.Product.style.in_(user_styles)).order_by(func.random()).limit(10).all()
-    else:
-        return []
+    if current_user:
+        # Force refresh to ensure latest categories are loaded
+        db.refresh(current_user)
+        if current_user.selected_categories:
+            user_styles = [cat.name for cat in current_user.selected_categories]
     
+    print(f"DEBUG: Styles: {user_styles}")
+
+    # 3. STRICT Personalized Matches
+    if user_styles:
+        # Case-insensitive matching for robust filtering
+        from sqlalchemy import or_
+        conditions = [models.Product.style.ilike(s) for s in user_styles]
+        
+        # --- CHANGE: Return ONLY matching items. No random fillers. ---
+        return base_query.filter(or_(*conditions)).order_by(func.random()).limit(20).all()
+
+    # 4. Cold Start (Only if user has NO styles selected at all)
+    print("DEBUG: No styles selected, showing random discovery items.")
+    return base_query.order_by(func.random()).limit(20).all()
+
 @app.get("/products/discover", response_model=List[ProductResponse])
 def get_discover_products(
     page: int = 1,
@@ -515,17 +551,23 @@ def get_discover_products(
     db: Session = Depends(get_db),
     current_user: Optional[models.User] = Depends(get_current_user_optional)
 ):
-    # This endpoint provides all other items with pagination.
-    
-    # 1. Base query (same as above)
     query = db.query(models.Product)
-    sold_ids = [row[0] for row in db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"])).all()]
+    
+    # --- SAME CRITICAL FIX HERE ---
+    sold_orders = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]),
+        models.Order.product_id.isnot(None)
+    ).all()
+    
+    sold_ids = [row[0] for row in sold_orders if row[0] is not None]
+    # ------------------------------
+
     if sold_ids:
         query = query.filter(models.Product.id.notin_(sold_ids))
+        
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
 
-    # 2. Apply pagination
     offset = (page - 1) * page_size
     return query.order_by(func.random()).offset(offset).limit(page_size).all()
 
@@ -599,7 +641,7 @@ def style_me(
         target_categories = ["Top", "Bottom", "Outerwear", "Dress", "Hat"] 
     elif source_item.category in ["Hat", "Accessory", "Bag"]:
         target_categories = ["Top", "Bottom", "Shoes", "Outerwear", "Dress"]
-    else:
+    else: 
         target_categories = ["Top", "Bottom", "Shoes", "Dress"]
 
     target_genders = ["Unisex"]
@@ -651,7 +693,7 @@ def style_me(
             final_matches.append(match)
 
     response_matches = []
-    for match in final_matches[:5]:
+    for match in final_matches[:5]: 
         if isinstance(match, models.Product):
             response_matches.append(StyledItemResponse.model_validate(match))
         elif isinstance(match, models.WardrobeItem):
@@ -661,7 +703,7 @@ def style_me(
                     name=f"My {match.style} {match.sub_category or match.category}",
                     price=None,
                     image_url=match.image_url,
-                    image_urls=[match.image_url],
+                    image_urls=[match.image_url], 
                     category=match.category,
                     sub_category=match.sub_category,
                     gender=match.gender,
@@ -674,7 +716,7 @@ def style_me(
 
     return {
         "user_item": source_item,
-        "styled_matches": response_matches,
+        "styled_matches": response_matches, 
         "style_tip": f"Matching {source_item.style} vibes for {source_item.gender}."
     }
 
@@ -735,13 +777,13 @@ def update_product(
     product_id: str, 
     updates: ProductUpdate, 
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user) # Require user for security
+    current_user: models.User = Depends(get_current_user)
 ):
     item = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not item: raise HTTPException(404, detail="Product not found")
 
     if item.user_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized to edit this product")
+        raise HTTPException(status_code=403, detail="Not authorized")
 
     update_data = updates.model_dump(exclude_unset=True)
     
@@ -761,7 +803,6 @@ def update_product(
     db.commit()
     db.refresh(item)
     return item
-
 
 @app.delete("/products/{product_id}")
 def delete_product(product_id: str, db: Session = Depends(get_db)):
