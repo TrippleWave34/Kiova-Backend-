@@ -311,10 +311,27 @@ def remove_background_hybrid(image_bytes: bytes) -> Image.Image:
 
 def process_and_upload(file_bytes, filename):
     try:
+        # 1. Hybrid Background Removal (API or Local)
         output_image = remove_background_hybrid(file_bytes)
+        
+        # 2. MATHEMATICAL AUTO-TRIM (The "Safety Net")
+        # Calculates the bounding box of the clothes and cuts off empty transparent space
+        bbox = output_image.getbbox()
+        if bbox:
+            left, upper, right, lower = bbox
+            # Add 10px padding so it's not too tight
+            width, height = output_image.size
+            left = max(0, left - 10)
+            upper = max(0, upper - 10)
+            right = min(width, right + 10)
+            lower = min(height, lower + 10)
+            output_image = output_image.crop((left, upper, right, lower))
+        
+        # 3. Upload
         output_buffer = io.BytesIO()
         output_image.save(output_buffer, format="PNG")
         output_buffer.seek(0)
+        
         unique_name = f"{uuid.uuid4()}.png"
         blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=unique_name)
         blob_client.upload_blob(
@@ -322,6 +339,7 @@ def process_and_upload(file_bytes, filename):
             content_settings=ContentSettings(content_type='image/png') 
         )
         return blob_client.url
+
     except Exception as e:
         print(f"❌ Critical Processing Error: {e}")
         raise HTTPException(status_code=500, detail="Image processing failed")
