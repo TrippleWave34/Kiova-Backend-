@@ -36,6 +36,7 @@ DEPLOYMENT_CHAT = os.getenv("AZURE_DEPLOYMENT_CHAT", "o4-mini")
 DEPLOYMENT_EMBEDDING = os.getenv("AZURE_DEPLOYMENT_EMBEDDING", "text-embedding-3-small")
 FIREBASE_CREDS_B64 = os.getenv("FIREBASE_CREDENTIALS_BASE64")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY")
 
 ALLOWED_CATEGORIES = [
     "Top", "Bottom", "Shoes", "Outerwear", "Dress", "Hat", "Accessory", "Bag"
@@ -211,6 +212,16 @@ class CategoryResponse(CategoryBase):
 class UserCategorySelection(BaseModel):
     category_ids: List[int]
 
+class WardrobeBatchCreate(BaseModel):
+    processed_image_url: str
+    category: str = "Unknown"
+    sub_category: str = ""
+    gender: str = "Unisex"
+    color: str = ""
+    pattern: str = ""
+    style: str = ""
+    tags: List[str] = []
+
 class PayoutInfoUpdate(BaseModel):
     info: str
 
@@ -267,10 +278,38 @@ def get_current_user_optional(
 # HELPER FUNCTIONS 
 # ==========================================
 
+def remove_background_hybrid(image_bytes: bytes) -> Image.Image:
+    """
+    Tries the external removebgapi.com first.
+    If it fails (error, timeout, no key), falls back to local rembg.
+    """
+    if REMOVE_BG_API_KEY:
+        try:
+            print("🎨 Calling removebgapi.com...")
+            response = requests.post(
+                "https://removebgapi.com/api/v1/remove",
+                headers={"Authorization": f"Bearer {REMOVE_BG_API_KEY}"},
+                files={"image_file": image_bytes},
+                data={"format": "png"},
+                timeout=10 # Set a timeout so we don't hang if API is slow
+            )
+            
+            if response.status_code == 200:
+                print("✅ External API Success!")
+                return Image.open(io.BytesIO(response.content))
+            else:
+                print(f"⚠️ External API Failed: {response.status_code} - {response.text}")
+        except Exception as e:
+            print(f"⚠️ External API Exception: {e}")
+    
+    # Fallback to local rembg
+    print("🔄 Falling back to local rembg...")
+    input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return remove(input_image)
+
 def process_and_upload(file_bytes, filename):
     try:
-        input_image = Image.open(io.BytesIO(file_bytes))
-        output_image = remove(input_image)
+        output_image = remove_background_hybrid(file_bytes)
         output_buffer = io.BytesIO()
         output_image.save(output_buffer, format="PNG")
         output_buffer.seek(0)
@@ -382,13 +421,10 @@ def _inject_emails(products: List[models.Product], db: Session, current_user: Op
     """
     is_admin = current_user.is_admin if current_user else False
     results = []
-    
-    # Cache to avoid repeated DB lookups for the same seller
     user_email_cache = {}
 
     for p in products:
         p_data = ProductResponse.model_validate(p)
-        
         if is_admin:
             if p.user_id in user_email_cache:
                 p_data.owner_email = user_email_cache[p.user_id]
@@ -399,7 +435,6 @@ def _inject_emails(products: List[models.Product], db: Session, current_user: Op
                     p_data.owner_email = owner.email
                 else:
                     p_data.owner_email = "Unknown (User Deleted)"
-        
         results.append(p_data)
     return results
 
@@ -448,8 +483,7 @@ async def analyze_image(
     skip_ai: bool = Form(False) 
 ):
     """
-    Standard Single Item Upload.
-    If skip_ai is True, it ONLY removes background and hosts the image.
+    Single Item Upload with Hybrid Background Removal.
     """
     image_url = process_and_upload(file.file.read(), file.filename)
     
@@ -470,9 +504,8 @@ async def analyze_image(
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, 
                    db: Session = Depends(get_db),
-                   current_user: models.User = Depends(get_current_user)): # Use required user now
+                   current_user: models.User = Depends(get_current_user)):
     
-    # Security: Only an admin can set an affiliate URL
     affiliate_link = None
     if current_user.is_admin and product.affiliate_url:
         affiliate_link = product.affiliate_url
@@ -649,7 +682,7 @@ def style_me(
 
     wardrobe_matches_db = db.query(models.WardrobeItem).filter(
         models.WardrobeItem.user_id == current_user.id,
-        models.WardrobeItem.id != getattr(source_item, 'id', ''), # Exclude source if it's a wardrobe item
+        models.WardrobeItem.id != getattr(source_item, 'id', ''), 
         models.WardrobeItem.category.in_(target_categories),
         models.WardrobeItem.gender.in_(target_genders)
     ).order_by(
@@ -661,7 +694,7 @@ def style_me(
     ).subquery()
     
     product_matches_db = db.query(models.Product).filter(
-        models.Product.id != getattr(source_item, 'id', ''), # Exclude source if it's a product
+        models.Product.id != getattr(source_item, 'id', ''), 
         models.Product.category.in_(target_categories),
         models.Product.gender.in_(target_genders),
         models.Product.id.notin_(sold_product_ids),     
@@ -669,7 +702,6 @@ def style_me(
     ).order_by(
         models.Product.embedding.cosine_distance(source_item.embedding)
     ).limit(10).all()
-
     
     def convert_to_response(item):
         if isinstance(item, models.Product):
