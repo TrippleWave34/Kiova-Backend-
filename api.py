@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 import models
 from database import engine, get_db
 from pydantic import BaseModel
-from rembg import remove
+from rembg import new_session, remove
 from PIL import Image
 import io
 import base64
@@ -70,6 +70,7 @@ ai_client = AzureOpenAI(
 )
 
 models.Base.metadata.create_all(bind=engine)
+fallback_session = new_session("u2netp") # If background removal API fails, use local low resource solution
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -281,7 +282,7 @@ def get_current_user_optional(
 def remove_background_hybrid(image_bytes: bytes) -> Image.Image:
     """
     Tries the external removebgapi.com first.
-    If it fails (error, timeout, no key), falls back to local rembg.
+    If it fails, falls back to the lightweight local rembg (u2netp).
     """
     if REMOVE_BG_API_KEY:
         try:
@@ -291,7 +292,7 @@ def remove_background_hybrid(image_bytes: bytes) -> Image.Image:
                 headers={"Authorization": f"Bearer {REMOVE_BG_API_KEY}"},
                 files={"image_file": image_bytes},
                 data={"format": "png"},
-                timeout=10 # Set a timeout so we don't hang if API is slow
+                timeout=30 
             )
             
             if response.status_code == 200:
@@ -301,6 +302,11 @@ def remove_background_hybrid(image_bytes: bytes) -> Image.Image:
                 print(f"⚠️ External API Failed: {response.status_code} - {response.text}")
         except Exception as e:
             print(f"⚠️ External API Exception: {e}")
+    else:
+        print("⚠️ No REMOVE_BG_API_KEY found in environment variables.")
+    print("🔄 Falling back to local rembg (u2netp)...")
+    input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return remove(input_image, session=fallback_session)
     
     # Fallback to local rembg
     print("🔄 Falling back to local rembg...")
@@ -321,7 +327,7 @@ def process_and_upload(file_bytes, filename):
         )
         return blob_client.url
     except Exception as e:
-        print(f"Background Removal Error: {e}")
+        print(f"❌ Critical Processing Error: {e}")
         raise HTTPException(status_code=500, detail="Image processing failed")
 
 def get_vector(text_input: str):
