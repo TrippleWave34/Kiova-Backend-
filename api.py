@@ -304,14 +304,10 @@ def remove_background_hybrid(image_bytes: bytes) -> Image.Image:
             print(f"⚠️ External API Exception: {e}")
     else:
         print("⚠️ No REMOVE_BG_API_KEY found in environment variables.")
+    
     print("🔄 Falling back to local rembg (u2netp)...")
     input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return remove(input_image, session=fallback_session)
-    
-    # Fallback to local rembg
-    print("🔄 Falling back to local rembg...")
-    input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    return remove(input_image)
 
 def process_and_upload(file_bytes, filename):
     try:
