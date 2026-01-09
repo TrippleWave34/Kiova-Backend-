@@ -147,6 +147,7 @@ class ProductUpdate(BaseModel):
 class ProductResponse(ProductCreate):
     id: str
     status: str = "AVAILABLE"
+    owner_email: Optional[str] = None
     class Config:
         from_attributes = True
 
@@ -192,7 +193,8 @@ class StyleSourceResponse(BaseModel):
 
 class StyleMeResponse(BaseModel):
     user_item: StyleSourceResponse
-    styled_matches: List[StyledItemResponse]
+    wardrobe_matches: List[StyledItemResponse]
+    product_matches: List[StyledItemResponse]
     style_tip: str
 
 class CategoryBase(BaseModel):
@@ -373,6 +375,34 @@ def transfer_to_wardrobe(db: Session, order: models.Order):
     )
     db.add(new_item)
 
+
+def _inject_emails(products: List[models.Product], db: Session, current_user: Optional[models.User]) -> List[ProductResponse]:
+    """
+    Helper to attach owner emails to products if the requester is an Admin.
+    """
+    is_admin = current_user.is_admin if current_user else False
+    results = []
+    
+    # Cache to avoid repeated DB lookups for the same seller
+    user_email_cache = {}
+
+    for p in products:
+        p_data = ProductResponse.model_validate(p)
+        
+        if is_admin:
+            if p.user_id in user_email_cache:
+                p_data.owner_email = user_email_cache[p.user_id]
+            else:
+                owner = db.query(models.User).filter(models.User.id == p.user_id).first()
+                if owner:
+                    user_email_cache[p.user_id] = owner.email
+                    p_data.owner_email = owner.email
+                else:
+                    p_data.owner_email = "Unknown (User Deleted)"
+        
+        results.append(p_data)
+    return results
+
 # ==========================================
 # ENDPOINTS
 # ==========================================
@@ -440,8 +470,9 @@ async def analyze_image(
 @app.post("/products", response_model=ProductResponse)
 def create_product(product: ProductCreate, 
                    db: Session = Depends(get_db),
-                   current_user: models.User = Depends(get_current_user)):
+                   current_user: models.User = Depends(get_current_user)): # Use required user now
     
+    # Security: Only an admin can set an affiliate URL
     affiliate_link = None
     if current_user.is_admin and product.affiliate_url:
         affiliate_link = product.affiliate_url
@@ -452,7 +483,6 @@ def create_product(product: ProductCreate,
         raise HTTPException(status_code=400, detail="You must set up Payout Details before listing an item.")
     
     new_id = str(uuid.uuid4())
-    clean_style = product.style.title() if product.style else "Casual"
     description = f"{product.gender} {product.style} {product.color} {product.sub_category} {product.name} {' '.join(product.tags)}"
     vector = get_vector(description)
     
@@ -470,7 +500,7 @@ def create_product(product: ProductCreate,
         style=product.style,
         tags=product.tags,
         embedding=vector,
-        affiliate_url=affiliate_link
+        affiliate_url=affiliate_link 
     )
     
     db.add(db_item)
@@ -496,53 +526,32 @@ def get_top_picks(
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
         
-    return query.order_by(func.random()).limit(5).all()
+    items = query.order_by(func.random()).limit(5).all()
+    return _inject_emails(items, db, current_user) 
 
 @app.get("/products/featured", response_model=List[ProductResponse])
 def get_featured_products(
     db: Session = Depends(get_db), 
     current_user: Optional[models.User] = Depends(get_current_user_optional)
 ):
-    # 1. Base Query
     base_query = db.query(models.Product)
-    
-    # Filter out sold items (Robust check against NULLs)
-    sold_orders = db.query(models.Order.product_id).filter(
-        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]),
-        models.Order.product_id.isnot(None) 
-    ).all()
-    
-    sold_ids = [row[0] for row in sold_orders if row[0] is not None]
-
+    sold_ids = [row[0] for row in db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"])).all()]
     if sold_ids:
         base_query = base_query.filter(models.Product.id.notin_(sold_ids))
-    
-    # Hide own items
     if current_user:
         base_query = base_query.filter(models.Product.user_id != current_user.id)
 
-    # 2. Get User Preferences
     user_styles = []
-    if current_user:
-        # Force refresh to ensure latest categories are loaded
-        db.refresh(current_user)
-        if current_user.selected_categories:
-            user_styles = [cat.name for cat in current_user.selected_categories]
-    
-    print(f"DEBUG: Styles: {user_styles}")
+    if current_user and current_user.selected_categories:
+        user_styles = [cat.name for cat in current_user.selected_categories]
 
-    # 3. STRICT Personalized Matches
+    items = []
     if user_styles:
-        # Case-insensitive matching for robust filtering
-        from sqlalchemy import or_
-        conditions = [models.Product.style.ilike(s) for s in user_styles]
+        items = base_query.filter(models.Product.style.in_(user_styles)).order_by(func.random()).limit(10).all()
+    else:
+        items = base_query.order_by(func.random()).limit(10).all()
         
-        # --- CHANGE: Return ONLY matching items. No random fillers. ---
-        return base_query.filter(or_(*conditions)).order_by(func.random()).limit(20).all()
-
-    # 4. Cold Start (Only if user has NO styles selected at all)
-    print("DEBUG: No styles selected, showing random discovery items.")
-    return base_query.order_by(func.random()).limit(20).all()
+    return _inject_emails(items, db, current_user) 
 
 @app.get("/products/discover", response_model=List[ProductResponse])
 def get_discover_products(
@@ -552,24 +561,16 @@ def get_discover_products(
     current_user: Optional[models.User] = Depends(get_current_user_optional)
 ):
     query = db.query(models.Product)
-    
-    # --- SAME CRITICAL FIX HERE ---
-    sold_orders = db.query(models.Order.product_id).filter(
-        models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"]),
-        models.Order.product_id.isnot(None)
-    ).all()
-    
-    sold_ids = [row[0] for row in sold_orders if row[0] is not None]
-    # ------------------------------
-
+    sold_ids = [row[0] for row in db.query(models.Order.product_id).filter(models.Order.status.in_(["PAID", "SHIPPED", "RECEIVED", "COMPLETED"])).all()]
     if sold_ids:
         query = query.filter(models.Product.id.notin_(sold_ids))
-        
     if current_user:
         query = query.filter(models.Product.user_id != current_user.id)
 
     offset = (page - 1) * page_size
-    return query.order_by(func.random()).offset(offset).limit(page_size).all()
+    items = query.order_by(func.random()).offset(offset).limit(page_size).all()
+    
+    return _inject_emails(items, db, current_user)
 
 @app.post("/wardrobe", response_model=WardrobeItemResponse)
 async def add_to_wardrobe(
@@ -616,11 +617,8 @@ def style_me(
     current_user: models.User = Depends(get_current_user)
 ):
     source_item = None
-    source_is_product = False
-
     if data.product_id:
         source_item = db.query(models.Product).filter(models.Product.id == data.product_id).first()
-        source_is_product = True
     elif data.wardrobe_item_id:
         source_item = db.query(models.WardrobeItem).filter(
             models.WardrobeItem.id == data.wardrobe_item_id,
@@ -649,74 +647,57 @@ def style_me(
     elif source_item.gender == "Women": target_genders.append("Women")
     else: target_genders.extend(["Men", "Women"])
 
-    matches_from_db = []
-    if source_is_product:
-        matches_from_db = db.query(models.WardrobeItem).filter(
-            models.WardrobeItem.user_id == current_user.id,
-            models.WardrobeItem.category.in_(target_categories),
-            models.WardrobeItem.gender.in_(target_genders)
-        ).order_by(
-            models.WardrobeItem.embedding.cosine_distance(source_item.embedding)
-        ).limit(10).all()
-    else:
-        sold_product_ids = db.query(models.Order.product_id).filter(
-            models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
-        ).subquery()
-        matches_from_db = db.query(models.Product).filter(
-            models.Product.category.in_(target_categories),
-            models.Product.gender.in_(target_genders),
-            models.Product.id.notin_(sold_product_ids),     
-            models.Product.user_id != current_user.id        
-        ).order_by(
-            models.Product.embedding.cosine_distance(source_item.embedding)
-        ).limit(10).all()
+    wardrobe_matches_db = db.query(models.WardrobeItem).filter(
+        models.WardrobeItem.user_id == current_user.id,
+        models.WardrobeItem.id != getattr(source_item, 'id', ''), # Exclude source if it's a wardrobe item
+        models.WardrobeItem.category.in_(target_categories),
+        models.WardrobeItem.gender.in_(target_genders)
+    ).order_by(
+        models.WardrobeItem.embedding.cosine_distance(source_item.embedding)
+    ).limit(10).all()
 
-    final_matches = []
-    categories_present = {source_item.category}
+    sold_product_ids = db.query(models.Order.product_id).filter(
+        models.Order.status.in_(["PAID", "SHIPPED", "COMPLETED"])
+    ).subquery()
     
-    if source_item.category == "Dress":
-        categories_present.update(["Top", "Bottom"])
-    elif source_item.category in ["Top", "Bottom", "Pants", "Skirt"]:
-        categories_present.add("Dress")
+    product_matches_db = db.query(models.Product).filter(
+        models.Product.id != getattr(source_item, 'id', ''), # Exclude source if it's a product
+        models.Product.category.in_(target_categories),
+        models.Product.gender.in_(target_genders),
+        models.Product.id.notin_(sold_product_ids),     
+        models.Product.user_id != current_user.id        
+    ).order_by(
+        models.Product.embedding.cosine_distance(source_item.embedding)
+    ).limit(10).all()
 
-    for match in matches_from_db:
-        cat = match.category
-        if cat == "Dress" and ("Top" in categories_present or "Bottom" in categories_present):
-            continue
-        if cat in ["Top", "Bottom"] and "Dress" in categories_present:
-            continue
-        if cat in ["Hat", "Accessory"] and ("Hat" in categories_present or "Accessory" in categories_present):
-             continue 
-
-        if cat not in categories_present:
-            categories_present.add(cat)
-            final_matches.append(match)
-
-    response_matches = []
-    for match in final_matches[:5]: 
-        if isinstance(match, models.Product):
-            response_matches.append(StyledItemResponse.model_validate(match))
-        elif isinstance(match, models.WardrobeItem):
-            response_matches.append(
-                StyledItemResponse(
-                    id=match.id,
-                    name=f"My {match.style} {match.sub_category or match.category}",
-                    price=None,
-                    image_url=match.image_url,
-                    image_urls=[match.image_url], 
-                    category=match.category,
-                    sub_category=match.sub_category,
-                    gender=match.gender,
-                    color=match.color,
-                    pattern=match.pattern,
-                    style=match.style,
-                    tags=match.tags
-                )
+    
+    def convert_to_response(item):
+        if isinstance(item, models.Product):
+            return StyledItemResponse.model_validate(item)
+        elif isinstance(item, models.WardrobeItem):
+            return StyledItemResponse(
+                id=item.id,
+                name=f"My {item.style} {item.sub_category or item.category}",
+                price=None,
+                image_url=item.image_url,
+                image_urls=[item.image_url],
+                category=item.category,
+                sub_category=item.sub_category,
+                gender=item.gender,
+                color=item.color,
+                pattern=item.pattern,
+                style=item.style,
+                tags=item.tags
             )
+        return None
+
+    wardrobe_response = [convert_to_response(item) for item in wardrobe_matches_db]
+    product_response = [convert_to_response(item) for item in product_matches_db]
 
     return {
         "user_item": source_item,
-        "styled_matches": response_matches, 
+        "wardrobe_matches": wardrobe_response,
+        "product_matches": product_response,
         "style_tip": f"Matching {source_item.style} vibes for {source_item.gender}."
     }
 
@@ -749,7 +730,8 @@ def get_products(
         search_term = f"%{search}%"
         query = query.filter(models.Product.name.ilike(search_term))
         
-    return query.all()
+    items = query.all()
+    return _inject_emails(items, db, current_user)
 
 @app.get("/products/me", response_model=List[ProductResponse])
 def get_my_products(
@@ -805,9 +787,17 @@ def update_product(
     return item
 
 @app.delete("/products/{product_id}")
-def delete_product(product_id: str, db: Session = Depends(get_db)):
+def delete_product(
+    product_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
     item = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not item: raise HTTPException(404, detail="Product not found")
+
+    if item.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this item")
+
     db.delete(item)
     db.commit()
     return {"status": "deleted", "id": product_id}
