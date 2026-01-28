@@ -779,8 +779,8 @@ def generate_outfit(
     items.extend(wardrobe_items)
     
     # Search in Products (if you allow mixing marketplace items)
-    # product_items = db.query(models.Product).filter(models.Product.id.in_(data.item_ids)).all()
-    # items.extend(product_items)
+    product_items = db.query(models.Product).filter(models.Product.id.in_(data.item_ids)).all()
+    items.extend(product_items)
 
     if not items:
         raise HTTPException(404, "No items found")
