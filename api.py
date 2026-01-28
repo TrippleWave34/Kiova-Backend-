@@ -24,6 +24,8 @@ from contextlib import asynccontextmanager
 import stripe
 from fastapi import Request 
 import requests
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
@@ -37,6 +39,7 @@ DEPLOYMENT_EMBEDDING = os.getenv("AZURE_DEPLOYMENT_EMBEDDING", "text-embedding-3
 FIREBASE_CREDS_B64 = os.getenv("FIREBASE_CREDENTIALS_BASE64")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 ALLOWED_CATEGORIES = [
     "Top", "Bottom", "Shoes", "Outerwear", "Dress", "Hat", "Accessory", "Bag"
@@ -233,6 +236,9 @@ class ShipOrderRequest(BaseModel):
 
 class OrderStatusUpdate(BaseModel):
     status: str
+
+class OutfitGenerationRequest(BaseModel):
+    item_ids: List[str]
 
 # ==========================================
 # AUTHENTICATION DEPENDENCY
@@ -752,6 +758,125 @@ def style_me(
         "product_matches": product_response,
         "style_tip": f"Matching {source_item.style} vibes for {source_item.gender}."
     }
+
+
+@app.post("/style-me/generate")
+def generate_outfit(
+    data: OutfitGenerationRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    if not GOOGLE_API_KEY:
+        raise HTTPException(500, "Google API Key not configured")
+
+    # 1. Fetch Items from DB
+    items = []
+    # Search in Wardrobe
+    wardrobe_items = db.query(models.WardrobeItem).filter(
+        models.WardrobeItem.id.in_(data.item_ids),
+        models.WardrobeItem.user_id == current_user.id
+    ).all()
+    items.extend(wardrobe_items)
+    
+    # Search in Products (if you allow mixing marketplace items)
+    # product_items = db.query(models.Product).filter(models.Product.id.in_(data.item_ids)).all()
+    # items.extend(product_items)
+
+    if not items:
+        raise HTTPException(404, "No items found")
+
+    # 2. Prepare Data for Gemini
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+    contents = []
+    contents.append("Instructions: Analyze these reference images to create a SINGLE high-fashion 'Ghost Mannequin' composite.")
+
+    prompt_descriptions = []
+
+    for i, item in enumerate(items):
+        # A. Download Image Bytes
+        try:
+            # We need the raw bytes for Gemini
+            img_response = requests.get(item.image_url)
+            img_response.raise_for_status()
+            img_bytes = img_response.content
+            mime_type = "image/png" # Azure usually returns png, but could check headers
+            
+            # B. Add Image Part
+            contents.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+            
+            # C. Add Text Description Part (for the Prompt)
+            # e.g., '1. "Top", "leather", "black"'
+            desc = f'{i+1}. "{item.category}", "{item.sub_category or ""}", "{item.color or ""}", "{item.style or ""}", "{item.tags or ""}"'
+            prompt_descriptions.append(desc)
+            
+        except Exception as e:
+            print(f"Error downloading {item.id}: {e}")
+            continue
+
+    # 3. Construct the Strict Prompt
+    joined_descriptions = "\n".join(prompt_descriptions)
+    
+    final_prompt = f"""
+    Task: Create a professional e-commerce "Ghost Mannequin" (Invisible Mannequin) composite image.
+
+    Subject Reference:
+    {joined_descriptions}
+
+    Strict Layout & Format Rules:
+    1. QUANTITY: Generate exactly ONE single outfit. Do NOT create a grid. Do NOT create a collage. Just ONE front-facing view in the center.
+    2. FORMAT: Vertical 9:16 Aspect Ratio (Tall Mobile Wallpaper).
+    3. COMPOSITION: Center the outfit. Leave white space at the top and bottom. 
+
+    Strict styling Rules:
+    1. FIDELITY: Use EXACT textures from images.
+    2. POSE: Vertical ghost mannequin.
+       - Order: Hat/Accessory (top) -> Top -> Bottom -> Shoes (bottom).
+    3. PHYSICS: 3D volume, realistic drapes.
+    4. ENVIRONMENT: Pure white background (#FFFFFF). Soft studio lighting. No body parts.
+    
+    ---
+    CRITICAL GENERATION CONSTRAINTS:
+    - Output Aspect Ratio: 9:16 (Vertical)
+    - Negative Prompt: Grid view, split screen, multiple variations, blurry, distorted patterns, low resolution, human body parts.
+    """
+    
+    contents.append(final_prompt)
+
+    try:
+        # 4. Call Gemini
+        print("Sending request to Gemini...")
+        response = client.models.generate_content(
+            model="gemini-3-pro-image-preview",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                temperature=0.0, 
+                max_output_tokens=2048
+            )
+        )
+
+        # 5. Process Result
+        if response.candidates:
+            for part in response.candidates[0].content.parts:
+                if part.inline_data:
+                    # We got an image!
+                    image_data = part.inline_data.data
+                    
+                    # 6. Upload Result to Azure
+                    output_buffer = io.BytesIO(image_data)
+                    unique_name = f"outfit_{uuid.uuid4()}.png"
+                    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=unique_name)
+                    blob_client.upload_blob(
+                        output_buffer, 
+                        content_settings=ContentSettings(content_type='image/png')
+                    )
+                    
+                    return {"status": "success", "generated_image_url": blob_client.url}
+        
+        raise HTTPException(500, "AI did not return an image.")
+
+    except Exception as e:
+        print(f"GenAI Error: {e}")
+        raise HTTPException(500, f"Generation failed: {str(e)}")
 
 @app.get("/products", response_model=List[ProductResponse])
 def get_products(
