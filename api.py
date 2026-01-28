@@ -760,7 +760,7 @@ def style_me(
     }
 
 
-@app.post("/style-me/generate")
+@app.post("/generate-style")
 def generate_outfit(
     data: OutfitGenerationRequest,
     db: Session = Depends(get_db),
