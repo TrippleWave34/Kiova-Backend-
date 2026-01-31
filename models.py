@@ -99,3 +99,20 @@ class Order(Base):
     product = relationship("Product")
     buyer = relationship("User", foreign_keys=[buyer_id])
     seller = relationship("User", foreign_keys=[seller_id])
+
+class SavedOutfit(Base):
+    __tablename__ = "saved_outfits"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True)
+    name = Column(String, default="My Styled Fit")
+    
+    # The final composite image URL from Gemini
+    generated_image_url = Column(String, nullable=False)
+    
+    # Store the IDs of the clothing items used in this outfit as JSON
+    item_ids = Column(JSON, nullable=True) 
+    
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    owner = relationship("User")

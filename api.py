@@ -240,6 +240,11 @@ class OrderStatusUpdate(BaseModel):
 class OutfitGenerationRequest(BaseModel):
     item_ids: List[str]
 
+class SavedOutfitCreate(BaseModel):
+    name: str
+    generated_image_url: str
+    item_ids: List[str]
+
 # ==========================================
 # AUTHENTICATION DEPENDENCY
 # ==========================================
@@ -1345,3 +1350,36 @@ def get_notifications(
         })
 
     return notifications
+
+@app.post("/outfits")
+def save_outfit(data: SavedOutfitCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    new_outfit = models.SavedOutfit(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        name=data.name,
+        generated_image_url=data.generated_image_url,
+        item_ids=data.item_ids
+    )
+    db.add(new_outfit)
+    db.commit()
+    return {"status": "success", "id": new_outfit.id}
+
+@app.get("/outfits")
+def get_saved_outfits(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    outfits = db.query(models.SavedOutfit).filter(models.SavedOutfit.user_id == current_user.id).all()
+    # Format for the frontend expectations
+    return [{
+        "id": o.id,
+        "name": o.name,
+        "preview_image_url": o.generated_image_url,
+        "items": o.item_ids
+    } for o in outfits]
+
+@app.delete("/outfits/{outfit_id}")
+def delete_outfit(outfit_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    outfit = db.query(models.SavedOutfit).filter(models.SavedOutfit.id == outfit_id, models.SavedOutfit.user_id == current_user.id).first()
+    if not outfit:
+        raise HTTPException(404, "Outfit not found")
+    db.delete(outfit)
+    db.commit()
+    return {"status": "deleted"}
