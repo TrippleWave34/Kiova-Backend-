@@ -473,7 +473,7 @@ def _inject_emails(products: List[models.Product], db: Session, current_user: Op
 # ENDPOINTS
 # ==========================================
 
-@app.post("/users/sync", response_model=UserSchema)
+@app.post("/users/sync/", response_model=UserSchema)
 def sync_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
     token = credentials.credentials
     decoded_token = auth.verify_id_token(token)
@@ -508,7 +508,7 @@ def update_payout_info(
     db.commit()
     return {"status": "updated"}
 
-@app.post("/analyze-image")
+@app.post("/analyze-image/")
 async def analyze_image(
     file: UploadFile = File(...),
     skip_ai: bool = Form(False) 
@@ -636,7 +636,7 @@ def get_discover_products(
     
     return _inject_emails(items, db, current_user)
 
-@app.post("/wardrobe", response_model=WardrobeItemResponse)
+@app.post("/wardrobe/", response_model=WardrobeItemResponse)
 async def add_to_wardrobe(
     file: UploadFile = File(...), 
     db: Session = Depends(get_db),
