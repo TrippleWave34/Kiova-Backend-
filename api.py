@@ -166,6 +166,10 @@ class WardrobeItemResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class WardrobeItemUpdate(BaseModel):
+    sub_category: Optional[str] = None
+    tags: Optional[List[str]] = None
+
 class StyledItemResponse(BaseModel):
     id: str
     name: Optional[str] = None
@@ -473,7 +477,7 @@ def _inject_emails(products: List[models.Product], db: Session, current_user: Op
 # ENDPOINTS
 # ==========================================
 
-@app.post("/users/sync/", response_model=UserSchema)
+@app.post("/users/sync", response_model=UserSchema)
 def sync_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
     token = credentials.credentials
     decoded_token = auth.verify_id_token(token)
@@ -673,6 +677,36 @@ def get_wardrobe(
     current_user: models.User = Depends(get_current_user)
 ):
     return db.query(models.WardrobeItem).filter(models.WardrobeItem.user_id == current_user.id).all()
+
+@app.put("/wardrobe/{item_id}", response_model=WardrobeItemResponse)
+def update_wardrobe_item(
+    item_id: str, 
+    updates: WardrobeItemUpdate, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    # 1. Find the item and ensure it belongs to the logged-in user
+    db_item = db.query(models.WardrobeItem).filter(
+        models.WardrobeItem.id == item_id, 
+        models.WardrobeItem.user_id == current_user.id
+    ).first()
+
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Wardrobe item not found or access denied")
+
+    # 2. Update fields if provided
+    update_data = updates.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_item, key, value)
+
+    # 3. Re-generate Vector Embedding (to keep 'Style Me' accurate)
+    # We use the updated fields + existing fields to build the new description
+    description = f"{db_item.gender} {db_item.style} {db_item.color} {db_item.sub_category} {' '.join(db_item.tags or [])}"
+    db_item.embedding = get_vector(description)
+
+    db.commit()
+    db.refresh(db_item)
+    return db_item
 
 @app.post("/style-me", response_model=StyleMeResponse)
 def style_me(
